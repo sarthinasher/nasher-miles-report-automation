@@ -1,0 +1,8 @@
+service_account.json
+token*.json
+credentials.json
+*.env
+__pycache__/
+*.pyc
+temp_downloads/
+*_downloads/
