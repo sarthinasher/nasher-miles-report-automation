@@ -3,7 +3,7 @@ name: Vinculum Sales Report to Drive
 
 on:
   schedule:
-    - cron: "30 3 * * *"
+    - cron: "40 3 * * *"
   workflow_dispatch: {}
 
 jobs:
