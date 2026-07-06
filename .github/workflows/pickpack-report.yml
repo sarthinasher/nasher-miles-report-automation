@@ -3,7 +3,7 @@ name: Pick Pack Report to Drive
 
 on:
   schedule:
-    - cron: "0 3 * * *"
+    - cron: "17 3 * * *"
   workflow_dispatch: {}
 
 jobs:
