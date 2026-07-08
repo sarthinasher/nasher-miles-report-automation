@@ -18,6 +18,7 @@ import os
 import time
 import json
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from DrissionPage import ChromiumPage, ChromiumOptions
 
@@ -38,6 +39,7 @@ GDRIVE_FOLDER_ID = os.environ.get(
 
 LOCAL_DOWNLOAD_PATH = "/tmp/inventory_downloads"
 BASE = "https://nashermiles.vineretail.com/eRetailWeb"
+IST = ZoneInfo("Asia/Kolkata")
 
 
 def fail(message, code=1):
@@ -513,7 +515,7 @@ def main():
         fail(f"Could not find the downloaded file in {LOCAL_DOWNLOAD_PATH}.")
 
     print(f"    [✓] Found file: {local_file}")
-    drive_filename = datetime.now().strftime("%d-%m-%Y_%H-%M")
+    drive_filename = datetime.now(IST).strftime("%d-%m-%Y_%H-%M")
     uploaded_file_id = upload_to_drive(drive_service, local_file, drive_filename, GDRIVE_FOLDER_ID)
 
     page.quit()
