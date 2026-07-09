@@ -17,6 +17,8 @@ Run locally for testing:
 
 import sys
 import os
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from common.drive_utils import (
@@ -45,6 +47,7 @@ SHAREPOINT_SITE_URL = os.environ.get(
 SHAREPOINT_FOLDER_PATH = os.environ.get("SP_SALES_FOLDER", "Sales/Vinculum")
 
 LOCAL_TMP = "/tmp/sp_sync"
+IST = ZoneInfo("Asia/Kolkata")
 
 
 def fail(message, code=1):
@@ -83,12 +86,11 @@ def main():
     print(f"    [OK] Newest file: {newest['name']} (modified {newest.get('modifiedTime')})")
 
     # ── 2. Export/download it locally as .xlsx ───────────
-    # Name the local xlsx after the Drive file. Google Sheets have no
-    # extension in their name, so append .xlsx; if it already ends in a
-    # spreadsheet extension, normalize to .xlsx.
-    base_name = newest["name"]
-    stem = os.path.splitext(base_name)[0] if "." in base_name else base_name
-    xlsx_name = f"{stem}.xlsx"
+    # Name the SharePoint file from YESTERDAY's date in DD.MM.YYYY format,
+    # so it's always e.g. 08.07.2026.xlsx regardless of how the source Drive
+    # file happens to be named.
+    yesterday = datetime.now(IST) - timedelta(days=1)
+    xlsx_name = yesterday.strftime("%d.%m.%Y") + ".xlsx"
     local_path = os.path.join(LOCAL_TMP, xlsx_name)
 
     print(f"\n[3] Downloading/exporting to {xlsx_name}...")
