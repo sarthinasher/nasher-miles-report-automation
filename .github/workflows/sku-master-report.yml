@@ -1,0 +1,35 @@
+name: Order Enquiry Report to Drive
+
+on:
+  schedule:
+    - cron: "35 4 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  run-order-enquiry-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run report script
+        env:
+          VIN_LOGIN_ID: ${{ secrets.VIN_LOGIN_ID }}
+          VIN_PASSWORD: ${{ secrets.VIN_PASSWORD }}
+          GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+        run: python scripts/order_enquiry_report_to_drive.py
