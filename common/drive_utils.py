@@ -111,3 +111,48 @@ def get_latest_downloaded_file(folder, extensions=(".xlsx", ".xls", ".csv"), sin
     if not candidates:
         return None
     return max(candidates, key=os.path.getmtime)
+
+
+def get_newest_drive_file(drive_service, folder_id):
+    """Returns metadata for the most recently modified file in a Drive folder,
+    or None if the folder is empty. Result: {id, name, mimeType, modifiedTime}."""
+    results = drive_service.files().list(
+        q=f"'{folder_id}' in parents and trashed=false",
+        fields="files(id,name,mimeType,modifiedTime)",
+        orderBy="modifiedTime desc",
+        pageSize=10,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute()
+    files = results.get("files", [])
+    return files[0] if files else None
+
+
+def download_drive_file_as_xlsx(drive_service, file_meta, dest_path):
+    """Downloads a Drive file to dest_path as .xlsx.
+    - If it's a native Google Sheet, export it to xlsx.
+    - If it's already an xlsx/xls/csv, download the raw bytes.
+    Returns dest_path."""
+    from googleapiclient.http import MediaIoBaseDownload
+    import io
+
+    file_id = file_meta["id"]
+    mime = file_meta.get("mimeType", "")
+
+    if mime == "application/vnd.google-apps.spreadsheet":
+        request = drive_service.files().export_media(
+            fileId=file_id,
+            mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    else:
+        request = drive_service.files().get_media(fileId=file_id, supportsAllDrives=True)
+
+    buf = io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, request)
+    done = False
+    while not done:
+        _status, done = downloader.next_chunk()
+
+    with open(dest_path, "wb") as f:
+        f.write(buf.getvalue())
+    return dest_path
