@@ -1,0 +1,39 @@
+name: Drive to SharePoint Inventory Sync
+
+on:
+  schedule:
+    # 14:00 IST = 08:30 UTC — runs after the daily inventory lands in Drive.
+    # Adjust the time to suit; cron here is in UTC.
+    - cron: "30 8 * * *"
+  workflow_dispatch:        # allows manual runs from the Actions tab
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install google-api-python-client google-auth requests
+
+      - name: Write service account key
+        run: echo "$GDRIVE_SA_JSON_CONTENT" > service_account.json
+        env:
+          GDRIVE_SA_JSON_CONTENT: ${{ secrets.GDRIVE_SA_JSON }}
+
+      - name: Run sync
+        env:
+          SP_TENANT_ID:  ${{ secrets.SP_TENANT_ID }}
+          SP_CLIENT_ID:  ${{ secrets.SP_CLIENT_ID }}
+          SP_CLIENT_SECRET: ${{ secrets.SP_CLIENT_SECRET }}
+          GDRIVE_SA_JSON: service_account.json
+        run: python drive_to_sharepoint_inventory.py
