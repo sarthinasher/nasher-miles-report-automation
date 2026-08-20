@@ -75,13 +75,61 @@ def main():
     print("    [OK] Drive API ready!")
 
     print("\n[1] Launching headless browser...")
+
+    # GitHub Actions / Linux-safe Chromium configuration
+    browser_profile = "/tmp/vinculum_chrome_profile"
+    os.makedirs(browser_profile, exist_ok=True)
+    
     co = ChromiumOptions()
-    co.headless(True)
+    
+    # Explicit headless mode
+    co.set_argument("--headless=new")
+    
+    # Required/recommended for GitHub Actions Linux runners
     co.set_argument("--no-sandbox")
     co.set_argument("--disable-dev-shm-usage")
     co.set_argument("--disable-gpu")
+    
+    # Prevent Chrome from trying to use an existing session/profile
+    co.set_argument(f"--user-data-dir={browser_profile}")
+    
+    # Give this run its own debugging port
+    co.set_argument("--remote-debugging-port=9222")
+    
+    # Stability options for CI
+    co.set_argument("--disable-software-rasterizer")
+    co.set_argument("--disable-extensions")
+    co.set_argument("--disable-background-networking")
+    co.set_argument("--disable-default-apps")
+    co.set_argument("--no-first-run")
+    co.set_argument("--no-default-browser-check")
     co.set_argument("--window-size=1920,1080")
-    page = ChromiumPage(addr_or_opts=co)
+    
+    # Explicitly tell DrissionPage where Chrome is
+    chrome_paths = [
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+    ]
+    
+    chrome_path = next((p for p in chrome_paths if os.path.exists(p)), None)
+    
+    if chrome_path:
+        print(f"    Chrome found: {chrome_path}")
+        co.set_browser_path(chrome_path)
+    else:
+        print("    [!] Chrome executable not found in standard paths")
+    
+    try:
+        page = ChromiumPage(addr_or_opts=co)
+    except Exception as e:
+        print("\n[ERROR] Failed to launch Chromium")
+        print(f"    Chrome path: {chrome_path}")
+        print(f"    Profile: {browser_profile}")
+        print(f"    Error: {e}")
+        raise
+    
     page.set.download_path(LOCAL_DOWNLOAD_PATH)
     print("    [OK] Browser launched!")
 
