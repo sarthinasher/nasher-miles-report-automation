@@ -79,6 +79,22 @@ def main():
     # GitHub Actions / Linux-safe Chromium configuration
     browser_profile = "/tmp/vinculum_chrome_profile"
     os.makedirs(browser_profile, exist_ok=True)
+
+    import subprocess
+
+    subprocess.run(
+        ["pkill", "-f", "chrome"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False
+    )
+    
+    subprocess.run(
+        ["pkill", "-f", "chromedriver"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False
+    )
     
     co = ChromiumOptions()
     
