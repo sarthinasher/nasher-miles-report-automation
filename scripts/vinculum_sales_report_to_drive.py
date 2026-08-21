@@ -93,10 +93,6 @@ def main():
     # Prevent Chrome from trying to use an existing session/profile
     co.set_argument(f"--user-data-dir={browser_profile}")
     
-    # Give this run its own debugging port
-    co.set_argument("--remote-debugging-port=9222")
-    
-    # Stability options for CI
     co.set_argument("--disable-software-rasterizer")
     co.set_argument("--disable-extensions")
     co.set_argument("--disable-background-networking")
