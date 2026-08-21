@@ -1,4 +1,3 @@
-
 """
 Nasher Miles eRetail - MIS Sales Report -> Google Drive Uploader
 ==================================================================
@@ -18,6 +17,7 @@ import sys
 import os
 import time
 import json
+import subprocess
 from datetime import datetime, timedelta
 
 from DrissionPage import ChromiumPage, ChromiumOptions
@@ -61,6 +61,91 @@ def validate_env():
         fail(f"Missing required environment variables/secrets: {', '.join(missing)}")
 
 
+def kill_stale_chrome():
+    """Kill any leftover Chrome/chromedriver from a previous run so the debug port is free."""
+    for target in ("chrome", "chromedriver"):
+        subprocess.run(
+            ["pkill", "-9", "-f", target],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    time.sleep(1)
+
+
+def build_chrome_options():
+    """
+    Build a CI-safe ChromiumOptions.
+
+    The three critical bits that fix the 'Handshake status 404 Not Found' failure:
+      1. --remote-allow-origins=*  -> modern Chrome refuses the DevTools websocket without it
+      2. co.auto_port()            -> fresh free debug port + fresh temp profile each run
+                                      (no collision with a leftover/locked profile)
+      3. --no-sandbox etc.         -> required on GitHub Actions Linux runners
+    """
+    co = ChromiumOptions()
+
+    # Fresh, unique debug port + fresh temp user-data-dir every launch.
+    # This REPLACES the old fixed --user-data-dir, which was a collision risk.
+    co.auto_port()
+
+    # Headless
+    co.set_argument("--headless=new")
+
+    # THE key fix for the 404 websocket handshake on modern Chrome.
+    co.set_argument("--remote-allow-origins=*")
+
+    # Required / recommended on CI Linux runners
+    co.set_argument("--no-sandbox")
+    co.set_argument("--disable-dev-shm-usage")
+    co.set_argument("--disable-gpu")
+    co.set_argument("--disable-software-rasterizer")
+
+    # Stability / determinism
+    co.set_argument("--disable-extensions")
+    co.set_argument("--disable-background-networking")
+    co.set_argument("--disable-default-apps")
+    co.set_argument("--disable-popup-blocking")
+    co.set_argument("--no-first-run")
+    co.set_argument("--no-default-browser-check")
+    co.set_argument("--window-size=1920,1080")
+
+    # Explicitly locate Chrome
+    chrome_paths = [
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+    ]
+    chrome_path = next((p for p in chrome_paths if os.path.exists(p)), None)
+    if chrome_path:
+        print(f"    Chrome found: {chrome_path}")
+        co.set_browser_path(chrome_path)
+    else:
+        print("    [!] Chrome executable not found in standard paths — letting DrissionPage auto-detect")
+
+    return co
+
+
+def launch_browser(max_attempts=3):
+    """Launch Chromium with retries. A cold CI runner occasionally loses the first handshake."""
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        print(f"    Launch attempt {attempt}/{max_attempts}...")
+        kill_stale_chrome()
+        co = build_chrome_options()
+        try:
+            page = ChromiumPage(addr_or_opts=co)
+            print("    [OK] Browser launched!")
+            return page
+        except Exception as e:
+            last_err = e
+            print(f"    [!] Attempt {attempt} failed: {e}")
+            time.sleep(3)
+    print("\n[ERROR] Failed to launch Chromium after all retries")
+    raise last_err
+
+
 def main():
     validate_env()
     os.makedirs(LOCAL_DOWNLOAD_PATH, exist_ok=True)
@@ -75,75 +160,9 @@ def main():
     print("    [OK] Drive API ready!")
 
     print("\n[1] Launching headless browser...")
+    page = launch_browser()
 
-    # GitHub Actions / Linux-safe Chromium configuration
-    browser_profile = "/tmp/vinculum_chrome_profile"
-    os.makedirs(browser_profile, exist_ok=True)
-
-    import subprocess
-
-    subprocess.run(
-        ["pkill", "-f", "chrome"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False
-    )
-    
-    subprocess.run(
-        ["pkill", "-f", "chromedriver"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False
-    )
-    
-    co = ChromiumOptions()
-    
-    # Explicit headless mode
-    co.set_argument("--headless=new")
-    
-    # Required/recommended for GitHub Actions Linux runners
-    co.set_argument("--no-sandbox")
-    co.set_argument("--disable-dev-shm-usage")
-    co.set_argument("--disable-gpu")
-    
-    # Prevent Chrome from trying to use an existing session/profile
-    co.set_argument(f"--user-data-dir={browser_profile}")
-    
-    co.set_argument("--disable-software-rasterizer")
-    co.set_argument("--disable-extensions")
-    co.set_argument("--disable-background-networking")
-    co.set_argument("--disable-default-apps")
-    co.set_argument("--no-first-run")
-    co.set_argument("--no-default-browser-check")
-    co.set_argument("--window-size=1920,1080")
-    
-    # Explicitly tell DrissionPage where Chrome is
-    chrome_paths = [
-        "/usr/bin/google-chrome",
-        "/usr/bin/google-chrome-stable",
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
-    ]
-    
-    chrome_path = next((p for p in chrome_paths if os.path.exists(p)), None)
-    
-    if chrome_path:
-        print(f"    Chrome found: {chrome_path}")
-        co.set_browser_path(chrome_path)
-    else:
-        print("    [!] Chrome executable not found in standard paths")
-    
-    try:
-        page = ChromiumPage(addr_or_opts=co)
-    except Exception as e:
-        print("\n[ERROR] Failed to launch Chromium")
-        print(f"    Chrome path: {chrome_path}")
-        print(f"    Profile: {browser_profile}")
-        print(f"    Error: {e}")
-        raise
-    
     page.set.download_path(LOCAL_DOWNLOAD_PATH)
-    print("    [OK] Browser launched!")
 
     # ── STEP 2: LOGIN ────────────────────────────────────
     print("\n[2] Logging in...")
