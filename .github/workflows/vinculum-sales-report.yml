@@ -1,4 +1,3 @@
-
 name: Vinculum Sales Report to Drive
 
 on:
@@ -10,7 +9,6 @@ jobs:
   run-vinculum-sales-report:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -19,6 +17,19 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      # Pin Chrome ourselves instead of depending on whatever version the
+      # runner image happens to ship. This is what prevents the intermittent
+      # "Handshake status 404 Not Found" DevTools failure.
+      - name: Set up Chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: Print Chrome version (for debugging)
+        run: |
+          which google-chrome || true
+          google-chrome --version || true
 
       - name: Install Python dependencies
         run: pip install -r requirements.txt
