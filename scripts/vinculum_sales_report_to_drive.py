@@ -75,25 +75,19 @@ def kill_stale_chrome():
 
 def build_chrome_options():
     """
-    Build a CI-safe ChromiumOptions.
+    CI-safe ChromiumOptions matching the known-good Pick Pack config.
 
-    The three critical bits that fix the 'Handshake status 404 Not Found' failure:
-      1. --remote-allow-origins=*  -> modern Chrome refuses the DevTools websocket without it
-      2. co.auto_port()            -> fresh free debug port + fresh temp profile each run
-                                      (no collision with a leftover/locked profile)
-      3. --no-sandbox etc.         -> required on GitHub Actions Linux runners
+    NOTE: We intentionally do NOT use co.auto_port() here. It was picking a
+    "free" port by opening+closing a socket and handing that number to Chrome,
+    which races on a cold CI runner: Chrome fails to bind that exact port while
+    DrissionPage tries to open the DevTools websocket on it -> the
+    'Handshake status 404 Not Found' error. Letting DrissionPage manage the
+    port/profile itself (as the working Pick Pack script does) fixes it.
     """
     co = ChromiumOptions()
 
-    # Fresh, unique debug port + fresh temp user-data-dir every launch.
-    # This REPLACES the old fixed --user-data-dir, which was a collision risk.
-    co.auto_port()
-
-    # Headless
-    co.set_argument("--headless=new")
-
-    # THE key fix for the 404 websocket handshake on modern Chrome.
-    co.set_argument("--remote-allow-origins=*")
+    # Headless (same flag the working script resolves to)
+    co.headless(True)
 
     # Required / recommended on CI Linux runners
     co.set_argument("--no-sandbox")
