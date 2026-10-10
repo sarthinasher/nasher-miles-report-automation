@@ -84,6 +84,13 @@
     ```
     Drive file `1Alel87Xw_yUIvdy0OikmIRnSQdXipbcO2dFcsyeP_yE` has all 39 columns
     (`Order No,Extern OrderNo,Order Date,…,Distribution Type`) and rows dated `06/10/2026`.
+  - Back-fill from main after commit d7b3201: run 38034642700 (`report_date=08/10/2026`) ->
+    `OrderEnquiry_08-10-2026: OK (attempt 1)`; run 38034754595 (blank = catch-up) ->
+    `Already in Drive (skipped): OrderEnquiry_07-10-2026, OrderEnquiry_08-10-2026` /
+    `OrderEnquiry_09-10-2026: OK (attempt 1)`.
+  - GT Full Flow dry-run after the back-fill (nasher-fms-automation run 38034854973):
+    `Combined Order Enquiry rows: 101,175` (unchanged), `matched now … 0`, October Order No still
+    `51` of `178` open rows — confirming the Full Flow does not read these files (see Blast radius).
 - **Blast radius:** Only `order_enquiry_report_to_drive.py` and its workflow. `common/drive_utils.py`
   unchanged. `scripts/sku_master_report_to_drive.py` has the same `native_click` header/row code and
   can fail the same way (weekly job, last failure 2026-08-31 was a session expiry) — not changed here.
