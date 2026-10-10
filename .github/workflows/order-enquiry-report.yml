@@ -24,9 +24,10 @@ on:
         type: boolean
 
 # Two runs logged in with the same Vinculum user at once kill each other's
-# session — never overlap Order Enquiry runs (queue instead).
+# session — never overlap. Shared with the SKU Master workflow, so neither
+# job can run while the other is logged in (a run waits instead).
 concurrency:
-  group: order-enquiry-report
+  group: vinculum-session
   cancel-in-progress: false
 
 jobs:

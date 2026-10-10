@@ -113,6 +113,27 @@ def get_latest_downloaded_file(folder, extensions=(".xlsx", ".xls", ".csv"), sin
     return max(candidates, key=os.path.getmtime)
 
 
+def list_file_names(drive_service, folder_id, name_contains):
+    """Names of the non-trashed files in folder_id whose name contains
+    name_contains. Returns None if Drive can't be listed (callers then must
+    not skip any work)."""
+    names, token = set(), None
+    try:
+        while True:
+            resp = drive_service.files().list(
+                q=f"'{folder_id}' in parents and trashed=false and name contains '{name_contains}'",
+                fields="nextPageToken, files(name)", pageSize=1000, pageToken=token,
+                supportsAllDrives=True, includeItemsFromAllDrives=True,
+            ).execute()
+            names.update(f["name"] for f in resp.get("files", []))
+            token = resp.get("nextPageToken")
+            if not token:
+                return names
+    except Exception as e:
+        print(f"    [!] Could not list Drive folder ({e!r}) — not skipping anything.")
+        return None
+
+
 def get_newest_drive_file(drive_service, folder_id):
     """Returns metadata for the most recently modified file in a Drive folder,
     or None if the folder is empty. Result: {id, name, mimeType, modifiedTime}."""

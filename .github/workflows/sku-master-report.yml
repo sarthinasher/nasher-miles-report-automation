@@ -2,13 +2,33 @@ name: SKU Master Report to Drive
 
 on:
   schedule:
-    - cron: "50 4 * * 1"
-  workflow_dispatch: {}
+    # Weekly snapshot. The first run does the export; the later ones only act
+    # if no "SKU Master DD-MM-YYYY" dated this week (Mon..today, IST) is in
+    # Drive yet, i.e. when an earlier run failed, was cancelled or was skipped
+    # by GitHub. Times avoid the Order Enquiry crons (04:35 / 09:35 UTC) and
+    # the other daily Vinculum jobs (03:17-04:09 UTC).
+    - cron: "50 6 * * 1"    # Mon 12:20 IST
+    - cron: "50 12 * * 1"   # Mon 18:20 IST (catch-up)
+    - cron: "50 6 * * 2"    # Tue 12:20 IST (catch-up)
+  workflow_dispatch:
+    inputs:
+      skip_existing:
+        description: "Skip if a SKU Master file dated this week is already in Drive (default: always export)"
+        required: false
+        default: false
+        type: boolean
+
+# Two runs logged in with the same Vinculum user at once kill each other's
+# session. This group is shared with the Order Enquiry workflow, so the two
+# never overlap (a run waits for the other instead).
+concurrency:
+  group: vinculum-session
+  cancel-in-progress: false
 
 jobs:
   run-sku-master-report:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 40
 
     steps:
       - name: Checkout repo
@@ -25,11 +45,24 @@ jobs:
           chrome-version: stable
 
       - name: Install Python dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements.txt pytest
+
+      - name: Run tests
+        run: python -m pytest tests -q
 
       - name: Run report script
         env:
           VIN_LOGIN_ID: ${{ secrets.VIN_LOGIN_ID }}
           VIN_PASSWORD: ${{ secrets.VIN_PASSWORD }}
           GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+          SKIP_EXISTING: ${{ inputs.skip_existing }}
+          PYTHONUNBUFFERED: "1"
         run: python scripts/sku_master_report_to_drive.py
+
+      - name: Upload failure screenshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sku-master-debug
+          path: /tmp/sku_master_debug
+          if-no-files-found: ignore

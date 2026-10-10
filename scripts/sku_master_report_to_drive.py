@@ -7,7 +7,18 @@ Drive auth via service account (see common/drive_utils.py).
 Login -> Master -> SKU Master -> Search -> (wait for data) -> Export ->
 (dialog) Export Type = Normal Export + Select ALL fields -> Export ->
 Pending Report -> wait for a NEW SkuEnquiryExport SUCCESS ->
-downloadReport() -> upload to Google Drive.
+downloadReport() -> upload to Google Drive as "SKU Master DD-MM-YYYY" (run date, IST).
+
+The SKU Master is a snapshot of the current catalogue (not a date range), so a
+missed week cannot be exported "as of" a past day — instead:
+  scheduled runs (several per week, see the workflow) export only if no
+      "SKU Master DD-MM-YYYY" file dated this week (Monday..today, IST) is in
+      Drive yet — so a failed/cancelled/skipped run is repaired by the next one;
+  manual runs (workflow_dispatch) always export, unless SKIP_EXISTING=true.
+Each run gets up to MAX_ATTEMPTS fresh-browser attempts, a screenshot per
+failed attempt (DEBUG_DIR, uploaded as the sku-master-debug artifact) and
+exits 1 if every attempt failed. Browser helpers shared with the Order Enquiry
+job live in common/vinculum_ui.py.
 
 Run locally for testing:
     VIN_LOGIN_ID=Sonali VIN_PASSWORD=... GDRIVE_SERVICE_ACCOUNT_JSON='{...}' \
@@ -18,13 +29,20 @@ import sys
 import os
 import time
 import json
+import traceback
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from DrissionPage import ChromiumPage, ChromiumOptions
-
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from common.drive_utils import get_drive_service, upload_to_drive, get_latest_downloaded_file
+from common.drive_utils import (
+    get_drive_service, upload_to_drive, get_latest_downloaded_file, list_file_names,
+)
+from common.report_dates import should_retry, weekly_file_present
+from common.report_dates import drive_filename as drive_filename_for
+from common.vinculum_ui import (
+    dismiss_top_modals, launch_browser, request_dialog_export,
+    save_debug_screenshot, select_all_export_fields,
+)
 
 # ── SETTINGS ──────────────────────────────────────────────
 LOGIN_ID = os.environ.get("VIN_LOGIN_ID")
@@ -36,16 +54,28 @@ MAX_WAIT_SECONDS = 240   # SKU Master is a large catalog export
 GDRIVE_FOLDER_ID = os.environ.get(
     "SKU_MASTER_DRIVE_FOLDER_ID", "1FcWUXpLckpusvBoQUBa66rqQ_b-c0K0o"
 )
+DRIVE_PREFIX = "SKU Master "
 
 LOCAL_DOWNLOAD_PATH = "/tmp/sku_master_downloads"
+DEBUG_DIR = os.environ.get("SKU_MASTER_DEBUG_DIR", "/tmp/sku_master_debug")
 REPORT_NAME_MATCH = "SkuEnquiryExport"
 BASE = "https://nashermiles.vineretail.com/eRetailWeb"
 IST = ZoneInfo("Asia/Kolkata")
+MAX_ATTEMPTS = int(os.environ.get("SKU_MASTER_MAX_ATTEMPTS", "2"))
+RETRY_PAUSE_SECONDS = 30
 
 
-def fail(message, code=1):
+class ExportError(Exception):
+    """One attempt failed. retryable=False for errors a fresh browser session
+    cannot fix."""
+    def __init__(self, message, retryable=True):
+        super().__init__(message)
+        self.retryable = retryable
+
+
+def fail(message, retryable=True):
     print(f"\n[✗] {message}")
-    sys.exit(code)
+    raise ExportError(message, retryable)
 
 
 def validate_env():
@@ -55,32 +85,29 @@ def validate_env():
         ("GDRIVE_SERVICE_ACCOUNT_JSON", os.environ.get("GDRIVE_SERVICE_ACCOUNT_JSON")),
     ] if not val]
     if missing:
-        fail(f"Missing required environment variables/secrets: {', '.join(missing)}")
+        print(f"\n[✗] Missing required environment variables/secrets: {', '.join(missing)}")
+        sys.exit(1)
 
 
-def main():
-    validate_env()
-    os.makedirs(LOCAL_DOWNLOAD_PATH, exist_ok=True)
-
-    print("=" * 55)
-    print("  Nasher Miles - SKU Master Export -> Google Drive")
-    print("=" * 55)
-
-    print("\n[0] Authenticating Google Drive API (service account)...")
-    drive_service = get_drive_service()
-    print("    [OK] Drive API ready!")
-
+def run_once(drive_service, run_day, attempt):
+    """One attempt: fresh browser -> export -> upload. Raises ExportError."""
     print("\n[1] Launching headless browser...")
-    co = ChromiumOptions()
-    co.headless(True)
-    co.set_argument("--no-sandbox")
-    co.set_argument("--disable-dev-shm-usage")
-    co.set_argument("--disable-gpu")
-    co.set_argument("--window-size=1920,1080")
-    page = ChromiumPage(addr_or_opts=co)
-    page.set.download_path(LOCAL_DOWNLOAD_PATH)
+    page = launch_browser(LOCAL_DOWNLOAD_PATH)
     print("    [OK] Browser launched!")
+    try:
+        _run_steps(page, drive_service, run_day)
+    except Exception:
+        save_debug_screenshot(page, DEBUG_DIR, f"fail_{run_day:%Y-%m-%d}_attempt{attempt}.png")
+        raise
+    finally:
+        try:
+            page.quit()
+        except Exception:
+            pass
 
+
+def _run_steps(page, drive_service, run_day):
+    """Steps 2-9 in an already-launched browser."""
     # ── STEP 2: LOGIN ────────────────────────────────────
     print("\n[2] Logging in...")
     page.get(f"{BASE}/eRetailLogin.action?popup=true")
@@ -114,9 +141,9 @@ def main():
 
     time.sleep(4)
     if "login" in page.url.lower():
-        page.quit()
         fail("Login failed — check VIN_LOGIN_ID / VIN_PASSWORD secrets.")
     print("[✓] Login successful!")
+    dismiss_top_modals(page, "after login")
 
     # ── SHARED: locate the frame hosting a marker text ───
     def find_context(marker_text, max_wait=15):
@@ -193,9 +220,9 @@ def main():
     if ctx is None:
         ctx, ctx_desc = find_context('Advance Search')
     if ctx is None:
-        page.quit()
         fail("Could not find the SKU Master grid in the page or any iframe.")
     print(f"    [✓] SKU Master content found in: {ctx_desc}")
+    dismiss_top_modals(page, "on SKU Master")
 
     # ── HELPER: click a visible element by exact text ────
     def js_click_visible_text(texts, tags=('a', 'span', 'li', 'button', 'div'), max_wait=15, context=None):
@@ -230,7 +257,6 @@ def main():
     if ok:
         print(f"    [✓] {info}")
     else:
-        page.quit()
         fail(f"Could not click Search ({info}).")
 
     time.sleep(4)
@@ -263,7 +289,6 @@ def main():
             break
         time.sleep(1)
     if not data_ready:
-        page.quit()
         fail("No SKU rows detected after Search — would export empty.")
     time.sleep(2)
 
@@ -278,7 +303,6 @@ def main():
     if ok:
         print(f"    [✓] {info}")
     else:
-        page.quit()
         fail(f"Could not click toolbar Export ({info}).")
     time.sleep(2)
 
@@ -317,7 +341,6 @@ def main():
 
     dctx, dctx_desc = find_dialog_ctx()
     if dctx is None:
-        page.quit()
         fail("Could not locate the export dialog in any context.")
     print(f"    [✓] Export dialog found in: {dctx_desc}")
     time.sleep(1)
@@ -351,7 +374,6 @@ def main():
             time.sleep(1)
 
     if inner is None:
-        page.quit()
         fail("Could not enter dynamicFieldDialogIFrame.")
 
     outer_dctx = dctx
@@ -382,62 +404,6 @@ def main():
     """)
     print(f"    [debug] {inner_diag}")
 
-    _DIALOG_BOXES_JS = """
-        return (function(){
-        function textOf(n){ return (n.innerText || n.textContent || '').trim(); }
-
-        function allBoxes(){
-            return Array.prototype.slice.call(document.querySelectorAll('input[type=checkbox]'))
-                .filter(function(b){
-                    var st = window.getComputedStyle(b);
-                    return !(st && (st.display === 'none' || st.visibility === 'hidden'));
-                });
-        }
-
-        function headerBox(){
-            var th = document.querySelector('th input[type=checkbox]');
-            if (th) return th;
-            var boxes = allBoxes();
-            for (var i=0;i<boxes.length;i++){
-                var n = boxes[i];
-                for (var d=0; d<5 && n; d++){
-                    if (n.tagName === 'TH' || /jqgfirstrow|ui-jqgrid-htable|hdrbox/i.test(n.className||'')) return boxes[i];
-                    n = n.parentElement;
-                }
-            }
-            return null;
-        }
-        function fieldBoxes(){
-            var hb = headerBox();
-            return allBoxes().filter(function(b){ return b !== hb; });
-        }
-
-        function rowNameOf(b){
-            var n = b;
-            for (var d=0; d<6 && n; d++){
-                var t = textOf(n).replace(/\\s+/g,' ');
-                if (t.length > 0 && t.length < 40) return t;
-                n = n.parentElement;
-            }
-            return '?';
-        }
-        function clickBox(b){
-            if (!b.checked) {
-                b.click();
-                if (window.jQuery) jQuery(b).trigger('click').trigger('change');
-                else b.dispatchEvent(new Event('change',{bubbles:true}));
-            }
-        }
-
-        function structureOK(){
-            var hasSelect = document.querySelectorAll('select').length > 0;
-            var hasTable  = document.querySelectorAll('table').length > 0;
-            var boxes     = fieldBoxes().length;
-            return hasSelect && hasTable && boxes > 0;
-        }
-    """
-    _DIALOG_BOXES_JS_END = "})();"
-
     src_result = dctx.run_js("""
         try {
             var sel = null;
@@ -457,169 +423,25 @@ def main():
     print(f"    Export Type -> {src_result}")
     time.sleep(1)
 
-    def read_field_state():
-        return dctx.run_js(_DIALOG_BOXES_JS + """
-            if (!structureOK()) return JSON.stringify({total:0, checked:0, bad:'NO_GRID'});
-            var fb = fieldBoxes();
-            var checked = fb.filter(function(b){ return b.checked; }).length;
-            return JSON.stringify({total: fb.length, checked: checked, bad:null});
-        """ + _DIALOG_BOXES_JS_END)
+    dismiss_top_modals(page, "before field selection")
 
-    def tag_field_boxes():
-        raw = dctx.run_js(_DIALOG_BOXES_JS + """
-            if (!structureOK()) return JSON.stringify({bad:'NO_GRID'});
-            var hb = headerBox();
-            if (hb && !hb.id) hb.id = 'AUTO_HDR_BOX';
-            var fb = fieldBoxes();
-            var list = [];
-            fb.forEach(function(b, i){
-                if (!b.id) b.id = 'AUTO_FLD_' + i;
-                list.push({id: b.id, name: rowNameOf(b), checked: !!b.checked, disabled: !!b.disabled});
-            });
-            return JSON.stringify({
-                bad: null,
-                header: hb ? hb.id : null,
-                fields: list
-            });
-        """ + _DIALOG_BOXES_JS_END)
-        try:
-            return json.loads(raw)
-        except Exception:
-            return {"bad": "PARSE", "fields": []}
-
-    def native_click(box_id):
-        try:
-            el = dctx.ele(f"#{box_id}", timeout=3)
-            if el:
-                el.click(by_js=False)
-                return True
-        except Exception:
-            pass
-        return False
-
-    def select_all_export_fields():
-        info = tag_field_boxes()
-        if info.get("bad"):
-            return f"{info['bad']}"
-        fields = info.get("fields", [])
-        if not fields:
-            return "NO_ROWS"
-
-        unchecked = [f for f in fields if not f["checked"] and not f["disabled"]]
-        if info.get("header") and unchecked:
-            native_click(info["header"])
-            time.sleep(0.8)
-
-        info2 = tag_field_boxes()
-        still_off = [f for f in info2.get("fields", []) if not f["checked"] and not f["disabled"]]
-        for f in still_off:
-            native_click(f["id"])
-            time.sleep(0.15)
-
-        final = tag_field_boxes()
-        flds = final.get("fields", [])
-        checked = sum(1 for f in flds if f["checked"])
-        sample = ",".join(f["name"] for f in flds[:8])
-        return f"OK|{checked}/{len(flds)} || headerNative || sample={sample}"
-
-    fields_ok = False
-    for attempt in range(1, 4):
-        result = select_all_export_fields()
-        print(f"    Select fields (try {attempt}) -> {result}")
-
-        if (result or "").startswith(("NO_GRID", "NO_ROWS")):
-            time.sleep(1.5)
-            continue
-
-        time.sleep(1.5)
-        try:
-            st = json.loads(read_field_state())
-        except Exception:
-            st = {"total": 0, "checked": 0, "bad": None}
-        if st.get("bad"):
-            print(f"    [!] Grid not detected ({st['bad']}) — retrying...")
-            time.sleep(1.5)
-            continue
-        if st["total"] > 0 and st["checked"] == st["total"]:
-            fields_ok = True
-            break
-
+    # Fields: JS clicks inside the iframe, verified (checkboxes AND jqGrid
+    # selection), native clicks only as fallback — common/vinculum_ui.py. The
+    # old code clicked the header "select all" box and each row by mouse
+    # coordinates and ignored the result: the failure mode that lost
+    # Order Enquiry days on 2026-10-07/09 (see Errors and their fixes/).
+    fields_ok, st = select_all_export_fields(page, dctx)
     if not fields_ok:
-        page.quit()
-        fail("Fields not fully selected — export would be rejected.")
+        print(f"    Still unchecked: {st.get('unchecked')}")
+        fail(f"Fields not fully selected ({st.get('checked')}/{st.get('total')}, jqGrid "
+             f"{st.get('jqSelected')}) — refusing to export a partial report.")
+    print(f"    [✓] All {st['total']} export fields selected.")
     time.sleep(1)
 
     print("    Clicking dialog Export...")
-
-    _EXPORT_FINDER_JS = """
-        return (function(){
-            function inDialog(el){
-                var n = el;
-                for (var i=0; i<15 && n; i++){
-                    var t = (n.innerText || '');
-                    if (t.indexOf('Select Field') !== -1 || t.indexOf('Export') !== -1) return true;
-                    n = n.parentElement;
-                }
-                return false;
-            }
-            var btns = document.querySelectorAll('button, a, input[type=button], input[type=submit]');
-            var byOnclick = null, byText = null;
-            for (var b of btns){
-                var txt = (b.innerText || b.textContent || b.value || '').trim();
-                var oc  = (b.getAttribute('onclick') || '');
-                var r   = b.getBoundingClientRect();
-                if (!(r.width > 0 && r.height > 0)) continue;
-                if (oc.indexOf('dynamicExport') !== -1) { byOnclick = b; break; }
-                if (txt === 'Export' && !byText) byText = b;
-            }
-            var target = byOnclick || byText;
-            if (!target) return "NO_DIALOG_EXPORT";
-            if (!target.id) target.id = 'AUTO_DLG_EXPORT';
-            return "FOUND|" + target.id + "|" + (target.getAttribute('onclick') || '');
-        })();
-    """
-
-    export_ctx = None
-    tag_result = "NO_DIALOG_EXPORT"
-    for label, cxt in (("inner iframe", dctx), ("outer modal", outer_dctx)):
-        res = cxt.run_js(_EXPORT_FINDER_JS)
-        print(f"    export button search ({label}) -> {res}")
-        if (res or "").startswith("FOUND"):
-            export_ctx = cxt
-            tag_result = res
-            break
-
-    if not (tag_result or "").startswith("FOUND"):
-        page.quit()
-        fail("Could not isolate the dialog Export button.")
-
-    btn_id = tag_result.split("|")[1]
-    dlg_clicked = False
-    try:
-        ebtn = export_ctx.ele(f"#{btn_id}", timeout=6)
-        if ebtn:
-            ebtn.click(by_js=False)
-            dlg_clicked = True
-            print("    [✓] Native click on dialog Export.")
-    except Exception as e:
-        print(f"    Native dialog click failed: {e}")
-
-    time.sleep(2)
-    still_open = outer_dctx.run_js("""
-        var els = document.querySelectorAll('div,h1,h2,h3,span');
-        for (var el of els){
-            if ((el.innerText || '').indexOf('Select Field For Export') !== -1){
-                var r = el.getBoundingClientRect();
-                if (r.width > 0 && r.height > 0) return true;
-            }
-        }
-        return false;
-    """)
-    print(f"    Dialog still open after click? {still_open}")
-
-    if not dlg_clicked:
-        page.quit()
-        fail("Could not click dialog Export.")
+    ok, msg = request_dialog_export(dctx, outer_dctx)
+    if not ok:
+        fail(msg)
     time.sleep(3)
 
     # ── STEP 7: OPEN PENDING REPORT PAGE ──────────────────
@@ -737,7 +559,6 @@ def main():
         time.sleep(3)
 
         if "login" in page.url.lower():
-            page.quit()
             fail("Session expired mid-run (redirected to login) while waiting for the report.")
 
         pctx, _ = find_pending_ctx(max_wait=5)
@@ -779,7 +600,6 @@ def main():
         time.sleep(10)
 
     if not downloaded:
-        page.quit()
         fail(f"Report did not download within {MAX_WAIT_SECONDS}s.")
 
     # ── STEP 9: UPLOAD TO DRIVE + CLEAN UP ────────────────
@@ -787,14 +607,11 @@ def main():
     local_file = downloaded_file or get_latest_downloaded_file(LOCAL_DOWNLOAD_PATH, since_ts=pre_download_ts)
 
     if not local_file:
-        page.quit()
         fail(f"Could not find the downloaded file in {LOCAL_DOWNLOAD_PATH}.")
 
     print(f"    [✓] Found file: {local_file}")
-    drive_filename = "SKU Master " + datetime.now(IST).strftime("%d-%m-%Y")
+    drive_filename = drive_filename_for(run_day, DRIVE_PREFIX)
     uploaded_file_id = upload_to_drive(drive_service, local_file, drive_filename, GDRIVE_FOLDER_ID)
-
-    page.quit()
 
     if not uploaded_file_id:
         fail("Drive upload failed. Check that the folder is shared with the service account's client_email.")
@@ -810,6 +627,53 @@ def main():
     print("  [✓] SUCCESS! SKU Master report uploaded to Google Drive as a Sheet.")
     print(f"  Drive folder: https://drive.google.com/drive/folders/{GDRIVE_FOLDER_ID}")
     print("=" * 55)
+
+
+def _env_true(name):
+    return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes", "y")
+
+
+def main():
+    validate_env()
+    os.makedirs(LOCAL_DOWNLOAD_PATH, exist_ok=True)
+
+    print("=" * 55)
+    print("  Nasher Miles - SKU Master Export -> Google Drive")
+    print("=" * 55)
+
+    print("\n[0] Authenticating Google Drive API (service account)...")
+    drive_service = get_drive_service()
+    print("    [OK] Drive API ready!")
+
+    today = datetime.now(IST).date()
+    scheduled = os.environ.get("GITHUB_EVENT_NAME") == "schedule"
+    skip_if_present = scheduled or _env_true("SKIP_EXISTING")
+    print(f"\n    Mode: {'scheduled (skip if this week already has a file)' if scheduled else 'manual'}"
+          f" — target file: {drive_filename_for(today, DRIVE_PREFIX)}")
+    if skip_if_present:
+        existing = list_file_names(drive_service, GDRIVE_FOLDER_ID, DRIVE_PREFIX.strip())
+        if existing is not None and weekly_file_present(today, existing, DRIVE_PREFIX):
+            print("\n[✓] Nothing to do — a SKU Master file dated this week is already in Drive.")
+            return
+
+    attempt = 1
+    while True:
+        try:
+            run_once(drive_service, today, attempt)
+            print(f"\n  {drive_filename_for(today, DRIVE_PREFIX)}: OK (attempt {attempt})")
+            return
+        except Exception as e:
+            retryable = getattr(e, "retryable", True)
+            if not isinstance(e, ExportError):
+                traceback.print_exc()
+            print(f"\n[!] Attempt {attempt}/{MAX_ATTEMPTS} failed: {e}")
+            if should_retry(attempt, MAX_ATTEMPTS, retryable):
+                print(f"    Retrying with a fresh browser in {RETRY_PAUSE_SECONDS}s...")
+                time.sleep(RETRY_PAUSE_SECONDS)
+                attempt += 1
+                continue
+            print(f"\n[✗] SKU Master not exported after {attempt} attempt(s).")
+            sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -102,3 +102,18 @@ def should_retry(attempt, max_attempts, error_retryable=True):
     with a fresh browser session. Config errors (bad credentials, missing
     secrets) are not retryable — retrying cannot fix them."""
     return error_retryable and attempt < max_attempts
+
+
+def week_start(day):
+    """Monday of day's week."""
+    return day - timedelta(days=day.weekday())
+
+
+def weekly_file_present(today, existing_names, prefix):
+    """True if a `prefix + DD-MM-YYYY` file dated this week (Monday .. today)
+    already exists. Used by snapshot reports exported once a week (SKU Master):
+    a later scheduled run in the same week then has nothing to do, while one
+    that follows a failed/cancelled/skipped run re-exports."""
+    start = week_start(today)
+    return any(drive_filename(start + timedelta(days=i), prefix) in existing_names
+               for i in range((today - start).days + 1))

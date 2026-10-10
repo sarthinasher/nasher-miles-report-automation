@@ -103,7 +103,9 @@
 - **Still open:** (1) Which popup (if any) blocked the clicks on 07/09 Oct is unconfirmed — the next
   occurrence will log `Closed Vinculum popup(s) …` and/or save a screenshot artifact. (2) The other
   Vinculum jobs in this repo log in with the same user on overlapping-ish schedules; only this workflow
-  is serialized. (3) `sku_master_report_to_drive.py` still uses the old click method. (4) Earlier lost
+  is serialized. (3) ~~`sku_master_report_to_drive.py` still uses the old click method.~~ Fixed — see
+  `2026-10-10-sku-master-fragile-clicks.md` (shared helpers in `common/vinculum_ui.py`, shared
+  `vinculum-session` concurrency group). (4) Earlier lost
   days (e.g. Aug/Sep failures) are outside the 3-day catch-up window — back-fill manually with
   `report_date` if they are needed.
 - **Related:** none in this folder (first record).

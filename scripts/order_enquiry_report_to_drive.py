@@ -33,15 +33,20 @@ import traceback
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from DrissionPage import ChromiumPage, ChromiumOptions
-
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from common.drive_utils import get_drive_service, upload_to_drive, get_latest_downloaded_file
+from common.drive_utils import (
+    get_drive_service, upload_to_drive, get_latest_downloaded_file, list_file_names,
+)
 from common.report_dates import (
     ReportDateError, default_window, parse_report_dates, pending_dates,
     should_retry, vinculum_date,
 )
 from common.report_dates import drive_filename as drive_filename_for
+from common.vinculum_ui import (
+    dismiss_top_modals, request_dialog_export, select_all_export_fields,
+)
+from common.vinculum_ui import launch_browser as _launch_browser
+from common.vinculum_ui import save_debug_screenshot as _save_debug_screenshot
 
 # ── SETTINGS ──────────────────────────────────────────────
 LOGIN_ID = os.environ.get("VIN_LOGIN_ID")
@@ -93,71 +98,12 @@ def validate_env():
         sys.exit(1)
 
 
-# Vinculum's top-level page carries hidden Bootstrap modals (z-index 1050 + a
-# full-page backdrop) that it opens on its own: #screenNotificationDialog
-# ("Remind me after 1 Hour ... / don't show this notification again") and
-# #feedbackFormDialog ("Take the Survey / Not Now"), among others. While one is
-# open, every coordinate (mouse-event) click lands on its backdrop, but JS
-# clicks still work — the suspected trigger of the 2026-10-07/09 "3/39 fields"
-# failure (see Errors and their fixes/2026-10-10-*). Close any open
-# one in the TOP document only (the export dialog lives inside an iframe and is
-# never touched by this). NOTE: which popup was open on the failing runs was not
-# captured (not reproduced in 6 diagnostic runs); this is defence in depth — the
-# field selection below no longer depends on coordinate clicks at all.
-_DISMISS_TOP_MODALS_JS = """
-    return (function(){
-        var closed = [];
-        document.querySelectorAll('.modal').forEach(function(m){
-            var st = window.getComputedStyle(m);
-            var r = m.getBoundingClientRect();
-            if (st.display === 'none' || st.visibility === 'hidden' || !(r.width > 0 && r.height > 0)) return;
-            var title = (m.querySelector('.modal-title') || {}).textContent || '';
-            closed.push((m.id || m.className) + (title ? ' "' + title.trim().slice(0, 60) + '"' : ''));
-            try { if (window.jQuery && jQuery.fn.modal) jQuery(m).modal('hide'); } catch (e) {}
-            m.style.display = 'none';
-            m.classList.remove('in');
-        });
-        var backdrops = document.querySelectorAll('.modal-backdrop');
-        backdrops.forEach(function(b){ b.parentNode && b.parentNode.removeChild(b); });
-        if (closed.length) document.body.classList.remove('modal-open');
-        return JSON.stringify({closed: closed, backdrops: backdrops.length});
-    })();
-"""
-
-
-def dismiss_top_modals(page, where):
-    """Closes any Vinculum popup open in the top document; logs what it closed."""
-    try:
-        res = json.loads(page.run_js(_DISMISS_TOP_MODALS_JS) or "{}")
-    except Exception as e:
-        print(f"    [!] popup check failed ({where}): {e!r}")
-        return []
-    if res.get("closed") or res.get("backdrops"):
-        print(f"    [!] Closed Vinculum popup(s) {where}: {res.get('closed')} "
-              f"(backdrops removed: {res.get('backdrops')})")
-    return res.get("closed") or []
-
-
 def save_debug_screenshot(page, name):
-    try:
-        os.makedirs(DEBUG_DIR, exist_ok=True)
-        page.get_screenshot(path=DEBUG_DIR, name=name, full_page=False)
-        print(f"    [debug] screenshot saved: {DEBUG_DIR}/{name}")
-    except Exception as e:
-        print(f"    [debug] screenshot failed: {e!r}")
+    _save_debug_screenshot(page, DEBUG_DIR, name)
 
 
 def launch_browser():
-    co = ChromiumOptions()
-    co.headless(True)
-    co.auto_port()   # fresh port + profile per attempt: a retry never reuses a dead session
-    co.set_argument("--no-sandbox")
-    co.set_argument("--disable-dev-shm-usage")
-    co.set_argument("--disable-gpu")
-    co.set_argument("--window-size=1920,1080")
-    page = ChromiumPage(addr_or_opts=co)
-    page.set.download_path(LOCAL_DOWNLOAD_PATH)
-    return page
+    return _launch_browser(LOCAL_DOWNLOAD_PATH)
 
 
 def run_once(drive_service, report_day, attempt):
@@ -484,62 +430,6 @@ def _run_steps(page, drive_service, report_day):
     """)
     print(f"    [debug] {inner_diag}")
 
-    _DIALOG_BOXES_JS = """
-        return (function(){
-        function textOf(n){ return (n.innerText || n.textContent || '').trim(); }
-
-        function allBoxes(){
-            return Array.prototype.slice.call(document.querySelectorAll('input[type=checkbox]'))
-                .filter(function(b){
-                    var st = window.getComputedStyle(b);
-                    return !(st && (st.display === 'none' || st.visibility === 'hidden'));
-                });
-        }
-
-        function headerBox(){
-            var th = document.querySelector('th input[type=checkbox]');
-            if (th) return th;
-            var boxes = allBoxes();
-            for (var i=0;i<boxes.length;i++){
-                var n = boxes[i];
-                for (var d=0; d<5 && n; d++){
-                    if (n.tagName === 'TH' || /jqgfirstrow|ui-jqgrid-htable|hdrbox/i.test(n.className||'')) return boxes[i];
-                    n = n.parentElement;
-                }
-            }
-            return null;
-        }
-        function fieldBoxes(){
-            var hb = headerBox();
-            return allBoxes().filter(function(b){ return b !== hb; });
-        }
-
-        function rowNameOf(b){
-            var n = b;
-            for (var d=0; d<6 && n; d++){
-                var t = textOf(n).replace(/\\s+/g,' ');
-                if (t.length > 0 && t.length < 40) return t;
-                n = n.parentElement;
-            }
-            return '?';
-        }
-        function clickBox(b){
-            if (!b.checked) {
-                b.click();
-                if (window.jQuery) jQuery(b).trigger('click').trigger('change');
-                else b.dispatchEvent(new Event('change',{bubbles:true}));
-            }
-        }
-
-        function structureOK(){
-            var hasSelect = document.querySelectorAll('select').length > 0;
-            var hasTable  = document.querySelectorAll('table').length > 0;
-            var boxes     = fieldBoxes().length;
-            return hasSelect && hasTable && boxes > 0;
-        }
-    """
-    _DIALOG_BOXES_JS_END = "})();"
-
     src_result = dctx.run_js("""
         try {
             var sel = null;
@@ -561,114 +451,12 @@ def _run_steps(page, drive_service, report_day):
     dismiss_top_modals(page, "before field selection")
 
     # Field grid = jqGrid "dynamicFieldGrid" (multiselect, 39 rows; Order No /
-    # Extern OrderNo / Order Date come pre-selected and locked). Rows are
-    # selected with element.click() run IN the iframe: it fires jqGrid's own
-    # row-checkbox handler, so it works whatever is drawn on top of the page,
-    # and for rows scrolled outside the 380px-high iframe. The old code clicked
-    # by mouse coordinates (header "select all" toggle, then each row) and
-    # ignored the result — when those clicks did not land (2026-10-07/09) every
-    # try stayed at the 3 locked fields. The header checkbox is a TOGGLE, so it
-    # is never clicked (clicking it when all are selected would clear them).
-    def read_field_state():
-        raw = dctx.run_js(_DIALOG_BOXES_JS + """
-            if (!structureOK()) return JSON.stringify({total:0, checked:0, bad:'NO_GRID'});
-            var fb = fieldBoxes();
-            var off = fb.filter(function(b){ return !b.checked; }).map(rowNameOf);
-            var sel = null, rows = null;
-            try {
-                if (window.jQuery && jQuery.fn.jqGrid) {
-                    var g = jQuery('table.ui-jqgrid-btable').first();
-                    if (g.length && g.jqGrid('getGridParam', 'multiselect')) {
-                        sel = (g.jqGrid('getGridParam', 'selarrrow') || []).length;
-                        rows = g.jqGrid('getGridParam', 'reccount');
-                    }
-                }
-            } catch (e) {}
-            return JSON.stringify({total: fb.length, checked: fb.length - off.length,
-                                   unchecked: off, jqSelected: sel, jqRows: rows, bad: null});
-        """ + _DIALOG_BOXES_JS_END)
-        try:
-            return json.loads(raw)
-        except Exception:
-            return {"total": 0, "checked": 0, "bad": "PARSE", "unchecked": []}
-
-    def all_fields_selected(st):
-        if st.get("bad") or not st.get("total"):
-            return False
-        if st["checked"] != st["total"]:
-            return False
-        # jqGrid's own selection list is what the export reads — must agree too
-        if st.get("jqSelected") is not None and st["jqSelected"] != st["total"]:
-            return False
-        return True
-
-    def js_click_unchecked():
-        raw = dctx.run_js(_DIALOG_BOXES_JS + """
-            if (!structureOK()) return JSON.stringify({bad:'NO_GRID', clicked:0});
-            var n = 0;
-            fieldBoxes().forEach(function(b){
-                if (!b.checked && !b.disabled) { b.click(); n++; }
-            });
-            return JSON.stringify({bad:null, clicked:n});
-        """ + _DIALOG_BOXES_JS_END)
-        try:
-            return json.loads(raw)
-        except Exception:
-            return {"bad": "PARSE", "clicked": 0}
-
-    def native_click_unchecked():
-        """Fallback only: mouse-event click on each still-unchecked row box.
-        Returns how many clicks DrissionPage reports as dispatched."""
-        ids = dctx.run_js(_DIALOG_BOXES_JS + """
-            var out = [];
-            fieldBoxes().forEach(function(b, i){
-                if (!b.checked && !b.disabled) { if (!b.id) b.id = 'AUTO_FLD_' + i; out.push(b.id); }
-            });
-            return JSON.stringify(out);
-        """ + _DIALOG_BOXES_JS_END)
-        done = 0
-        for box_id in json.loads(ids or "[]"):
-            try:
-                el = dctx.ele(f"#{box_id}", timeout=3)
-                if el and el.click(by_js=False):
-                    done += 1
-            except Exception as e:
-                print(f"      native click #{box_id} failed: {e!r}")
-            time.sleep(0.15)
-        return done
-
-    fields_ok = False
-    st = read_field_state()
-    print(f"    Fields before: {st.get('checked')}/{st.get('total')} checked"
-          f" (jqGrid selected {st.get('jqSelected')}/{st.get('jqRows')})")
-    for attempt in range(1, 4):
-        if all_fields_selected(st):
-            fields_ok = True
-            break
-        if st.get("bad"):
-            print(f"    [!] Field grid not ready ({st['bad']}) — waiting...")
-            time.sleep(1.5)
-            st = read_field_state()
-            continue
-        res = js_click_unchecked()
-        time.sleep(1)
-        st = read_field_state()
-        print(f"    Select fields (try {attempt}) JS-click {res.get('clicked')} boxes -> "
-              f"{st.get('checked')}/{st.get('total')} checked, jqGrid selected "
-              f"{st.get('jqSelected')}/{st.get('jqRows')}")
-        if all_fields_selected(st):
-            fields_ok = True
-            break
-        n = native_click_unchecked()
-        time.sleep(1)
-        st = read_field_state()
-        print(f"    Select fields (try {attempt}) native-click fallback {n} boxes -> "
-              f"{st.get('checked')}/{st.get('total')} checked")
-        if all_fields_selected(st):
-            fields_ok = True
-            break
-        dismiss_top_modals(page, "before re-trying field selection")
-
+    # Extern OrderNo / Order Date come pre-selected and locked). Selected with
+    # JS clicks inside the iframe and verified (checkboxes AND jqGrid
+    # selection); native clicks only as fallback — see common/vinculum_ui.py.
+    # The old code clicked by mouse coordinates and ignored the result — when
+    # those clicks did not land (2026-10-07/09) every try stayed at 3/39.
+    fields_ok, st = select_all_export_fields(page, dctx)
     if not fields_ok:
         print(f"    Still unchecked: {st.get('unchecked')}")
         fail(f"Fields not fully selected ({st.get('checked')}/{st.get('total')}, jqGrid "
@@ -677,95 +465,10 @@ def _run_steps(page, drive_service, report_day):
     time.sleep(1)
 
     print("    Clicking dialog Export...")
+    ok, msg = request_dialog_export(dctx, outer_dctx)
+    if not ok:
+        fail(msg)
 
-    _EXPORT_FINDER_JS = """
-        return (function(){
-            function inDialog(el){
-                var n = el;
-                for (var i=0; i<15 && n; i++){
-                    var t = (n.innerText || '');
-                    if (t.indexOf('Select Field') !== -1 || t.indexOf('Export') !== -1) return true;
-                    n = n.parentElement;
-                }
-                return false;
-            }
-            var btns = document.querySelectorAll('button, a, input[type=button], input[type=submit]');
-            var byOnclick = null, byText = null;
-            for (var b of btns){
-                var txt = (b.innerText || b.textContent || b.value || '').trim();
-                var oc  = (b.getAttribute('onclick') || '');
-                var r   = b.getBoundingClientRect();
-                if (!(r.width > 0 && r.height > 0)) continue;
-                if (oc.indexOf('dynamicExport') !== -1) { byOnclick = b; break; }
-                if (txt === 'Export' && !byText) byText = b;
-            }
-            var target = byOnclick || byText;
-            if (!target) return "NO_DIALOG_EXPORT";
-            if (!target.id) target.id = 'AUTO_DLG_EXPORT';
-            return "FOUND|" + target.id + "|" + (target.getAttribute('onclick') || '');
-        })();
-    """
-
-    export_ctx = None
-    tag_result = "NO_DIALOG_EXPORT"
-    for label, cxt in (("inner iframe", dctx), ("outer modal", outer_dctx)):
-        res = cxt.run_js(_EXPORT_FINDER_JS)
-        print(f"    export button search ({label}) -> {res}")
-        if (res or "").startswith("FOUND"):
-            export_ctx = cxt
-            tag_result = res
-            break
-
-    if not (tag_result or "").startswith("FOUND"):
-        fail("Could not isolate the dialog Export button.")
-
-    btn_id = tag_result.split("|")[1]
-
-    _DIALOG_OPEN_JS = """
-        var els = document.querySelectorAll('div,h1,h2,h3,span');
-        for (var el of els){
-            if ((el.innerText || '').indexOf('Select Field For Export') !== -1){
-                var r = el.getBoundingClientRect();
-                if (r.width > 0 && r.height > 0) return true;
-            }
-        }
-        return false;
-    """
-
-    def dialog_open():
-        try:
-            return bool(outer_dctx.run_js(_DIALOG_OPEN_JS))
-        except Exception:
-            return False
-
-    dlg_clicked = False
-    try:
-        ebtn = export_ctx.ele(f"#{btn_id}", timeout=6)
-        if ebtn and ebtn.click(by_js=False):
-            dlg_clicked = True
-            print("    [✓] Native click on dialog Export.")
-    except Exception as e:
-        print(f"    Native dialog click failed: {e}")
-
-    time.sleep(2)
-    still_open = dialog_open()
-    print(f"    Dialog still open after click? {still_open}")
-    if still_open:
-        # The native click did not land (same failure class as the field
-        # checkboxes) — fire the button's own click handler instead.
-        res = export_ctx.run_js(
-            f"var b = document.getElementById({json.dumps(btn_id)});"
-            " if (!b) return 'NO_BUTTON'; b.click(); return 'JS_CLICKED';")
-        print(f"    Dialog Export JS-click fallback -> {res}")
-        dlg_clicked = dlg_clicked or res == "JS_CLICKED"
-        time.sleep(3)
-        still_open = dialog_open()
-        print(f"    Dialog still open after JS click? {still_open}")
-        if still_open:
-            fail("Export dialog did not close after clicking Export — export not requested.")
-
-    if not dlg_clicked:
-        fail("Could not click dialog Export.")
     _last_export_request_ts = time.time()
     time.sleep(3)
 
@@ -954,21 +657,7 @@ def _run_steps(page, drive_service, report_day):
 def existing_drive_names(drive_service, folder_id, prefix="OrderEnquiry_"):
     """Names of the non-trashed files in the folder starting with prefix.
     Returns None if Drive can't be listed (caller then exports everything)."""
-    names, token = set(), None
-    try:
-        while True:
-            resp = drive_service.files().list(
-                q=f"'{folder_id}' in parents and trashed=false and name contains '{prefix}'",
-                fields="nextPageToken, files(name)", pageSize=1000, pageToken=token,
-                supportsAllDrives=True, includeItemsFromAllDrives=True,
-            ).execute()
-            names.update(f["name"] for f in resp.get("files", []))
-            token = resp.get("nextPageToken")
-            if not token:
-                return names
-    except Exception as e:
-        print(f"    [!] Could not list Drive folder ({e!r}) — not skipping any date.")
-        return None
+    return list_file_names(drive_service, folder_id, prefix)
 
 
 def _env_true(name):
