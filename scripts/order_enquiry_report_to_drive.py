@@ -4,27 +4,44 @@ Nasher Miles eRetail - Order Enquiry Export -> Google Drive Uploader
 CI / GitHub Actions version. Headless Chrome, all secrets from env vars,
 Drive auth via service account (see common/drive_utils.py).
 
-Login -> Sales -> Order Enquiry -> Order Date = YESTERDAY -> Search ->
+Login -> Sales -> Order Enquiry -> Order Date = REPORT DATE -> Search ->
 Export -> (dialog) Order Source = WMS + Select ALL fields -> Export ->
 Pending Report -> wait for a NEW OrderEnquiryExport SUCCESS ->
-downloadReport() -> upload to Google Drive.
+downloadReport() -> upload to Google Drive as OrderEnquiry_DD-MM-YYYY
+(the REPORT date, not the run date).
+
+Which dates (see common/report_dates.py):
+  REPORT_DATE unset/blank -> catch-up: the last 3 days ending yesterday (IST)
+                             whose file is NOT yet in Drive (normally just yesterday;
+                             a day lost to a failed run is picked up by the next run).
+  REPORT_DATE=08/10/2026 | 06/10/2026,08/10/2026 | 06/10/2026-09/10/2026
+                          -> exactly those dates (re-exported even if the file exists,
+                             unless SKIP_EXISTING=true).
+Each date gets up to MAX_ATTEMPTS fresh-browser attempts; the run exits 1 if any
+date still failed, so the failure shows in Actions.
 
 Run locally for testing:
     VIN_LOGIN_ID=Sonali VIN_PASSWORD=... GDRIVE_SERVICE_ACCOUNT_JSON='{...}' \
-        python scripts/order_enquiry_report_to_drive.py
+        REPORT_DATE=08/10/2026 python scripts/order_enquiry_report_to_drive.py
 """
 
 import sys
 import os
 import time
 import json
-from datetime import datetime, timedelta
+import traceback
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from DrissionPage import ChromiumPage, ChromiumOptions
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from common.drive_utils import get_drive_service, upload_to_drive, get_latest_downloaded_file
+from common.report_dates import (
+    ReportDateError, default_window, parse_report_dates, pending_dates,
+    should_retry, vinculum_date,
+)
+from common.report_dates import drive_filename as drive_filename_for
 
 # ── SETTINGS ──────────────────────────────────────────────
 LOGIN_ID = os.environ.get("VIN_LOGIN_ID")
@@ -41,14 +58,28 @@ GDRIVE_FOLDER_ID = os.environ.get(
 )
 
 LOCAL_DOWNLOAD_PATH = "/tmp/order_enquiry_downloads"
+DEBUG_DIR = os.environ.get("ORDER_ENQUIRY_DEBUG_DIR", "/tmp/order_enquiry_debug")
 REPORT_NAME_MATCH = "OrderEnquiryExport"
 BASE = "https://nashermiles.vineretail.com/eRetailWeb"
 IST = ZoneInfo("Asia/Kolkata")
+MAX_ATTEMPTS = int(os.environ.get("ORDER_ENQUIRY_MAX_ATTEMPTS", "2"))   # per report date
+RETRY_PAUSE_SECONDS = 30
+EXPORT_GAP_SECONDS = 130     # min time between two export requests in one process (see step 6)
+_last_export_request_ts = 0.0
+_seen_report_ids = set()     # Pending Report ids already used/seen by an earlier attempt
 
 
-def fail(message, code=1):
+class ExportError(Exception):
+    """One attempt for one report date failed. retryable=False for errors a
+    fresh browser session cannot fix."""
+    def __init__(self, message, retryable=True):
+        super().__init__(message)
+        self.retryable = retryable
+
+
+def fail(message, retryable=True):
     print(f"\n[✗] {message}")
-    sys.exit(code)
+    raise ExportError(message, retryable)
 
 
 def validate_env():
@@ -58,32 +89,96 @@ def validate_env():
         ("GDRIVE_SERVICE_ACCOUNT_JSON", os.environ.get("GDRIVE_SERVICE_ACCOUNT_JSON")),
     ] if not val]
     if missing:
-        fail(f"Missing required environment variables/secrets: {', '.join(missing)}")
+        print(f"\n[✗] Missing required environment variables/secrets: {', '.join(missing)}")
+        sys.exit(1)
 
 
-def main():
-    validate_env()
-    os.makedirs(LOCAL_DOWNLOAD_PATH, exist_ok=True)
+# Vinculum's top-level page carries hidden Bootstrap modals (z-index 1050 + a
+# full-page backdrop) that it opens on its own: #screenNotificationDialog
+# ("Remind me after 1 Hour ... / don't show this notification again") and
+# #feedbackFormDialog ("Take the Survey / Not Now"), among others. While one is
+# open, every coordinate (mouse-event) click lands on its backdrop, but JS
+# clicks still work — the suspected trigger of the 2026-10-07/09 "3/39 fields"
+# failure (see Errors and their fixes/2026-10-10-*). Close any open
+# one in the TOP document only (the export dialog lives inside an iframe and is
+# never touched by this). NOTE: which popup was open on the failing runs was not
+# captured (not reproduced in 6 diagnostic runs); this is defence in depth — the
+# field selection below no longer depends on coordinate clicks at all.
+_DISMISS_TOP_MODALS_JS = """
+    return (function(){
+        var closed = [];
+        document.querySelectorAll('.modal').forEach(function(m){
+            var st = window.getComputedStyle(m);
+            var r = m.getBoundingClientRect();
+            if (st.display === 'none' || st.visibility === 'hidden' || !(r.width > 0 && r.height > 0)) return;
+            var title = (m.querySelector('.modal-title') || {}).textContent || '';
+            closed.push((m.id || m.className) + (title ? ' "' + title.trim().slice(0, 60) + '"' : ''));
+            try { if (window.jQuery && jQuery.fn.modal) jQuery(m).modal('hide'); } catch (e) {}
+            m.style.display = 'none';
+            m.classList.remove('in');
+        });
+        var backdrops = document.querySelectorAll('.modal-backdrop');
+        backdrops.forEach(function(b){ b.parentNode && b.parentNode.removeChild(b); });
+        if (closed.length) document.body.classList.remove('modal-open');
+        return JSON.stringify({closed: closed, backdrops: backdrops.length});
+    })();
+"""
 
-    print("=" * 55)
-    print("  Nasher Miles - Order Enquiry Export -> Google Drive")
-    print("=" * 55)
 
-    print("\n[0] Authenticating Google Drive API (service account)...")
-    drive_service = get_drive_service()
-    print("    [OK] Drive API ready!")
+def dismiss_top_modals(page, where):
+    """Closes any Vinculum popup open in the top document; logs what it closed."""
+    try:
+        res = json.loads(page.run_js(_DISMISS_TOP_MODALS_JS) or "{}")
+    except Exception as e:
+        print(f"    [!] popup check failed ({where}): {e!r}")
+        return []
+    if res.get("closed") or res.get("backdrops"):
+        print(f"    [!] Closed Vinculum popup(s) {where}: {res.get('closed')} "
+              f"(backdrops removed: {res.get('backdrops')})")
+    return res.get("closed") or []
 
-    print("\n[1] Launching headless browser...")
+
+def save_debug_screenshot(page, name):
+    try:
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+        page.get_screenshot(path=DEBUG_DIR, name=name, full_page=False)
+        print(f"    [debug] screenshot saved: {DEBUG_DIR}/{name}")
+    except Exception as e:
+        print(f"    [debug] screenshot failed: {e!r}")
+
+
+def launch_browser():
     co = ChromiumOptions()
     co.headless(True)
+    co.auto_port()   # fresh port + profile per attempt: a retry never reuses a dead session
     co.set_argument("--no-sandbox")
     co.set_argument("--disable-dev-shm-usage")
     co.set_argument("--disable-gpu")
     co.set_argument("--window-size=1920,1080")
     page = ChromiumPage(addr_or_opts=co)
     page.set.download_path(LOCAL_DOWNLOAD_PATH)
-    print("    [OK] Browser launched!")
+    return page
 
+
+def run_once(drive_service, report_day, attempt):
+    """One attempt: fresh browser -> export report_day -> upload. Raises ExportError."""
+    print("\n[1] Launching headless browser...")
+    page = launch_browser()
+    print("    [OK] Browser launched!")
+    try:
+        _run_steps(page, drive_service, report_day)
+    except Exception:
+        save_debug_screenshot(page, f"fail_{report_day:%Y-%m-%d}_attempt{attempt}.png")
+        raise
+    finally:
+        try:
+            page.quit()
+        except Exception:
+            pass
+
+
+def _run_steps(page, drive_service, report_day):
+    """Steps 2-10 for one report date in an already-launched browser."""
     # ── STEP 2: LOGIN ────────────────────────────────────
     print("\n[2] Logging in...")
     page.get(f"{BASE}/eRetailLogin.action?popup=true")
@@ -117,9 +212,9 @@ def main():
 
     time.sleep(4)
     if "login" in page.url.lower():
-        page.quit()
         fail("Login failed — check VIN_LOGIN_ID / VIN_PASSWORD secrets.")
     print("[✓] Login successful!")
+    dismiss_top_modals(page, "after login")
 
     # ── SHARED: locate the frame hosting a marker text ───
     def find_context(marker_text, max_wait=15):
@@ -194,14 +289,13 @@ def main():
     if ctx is None:
         ctx, ctx_desc = find_context('Advance Search')
     if ctx is None:
-        page.quit()
         fail("Could not find the Order Enquiry grid in the page or any iframe.")
     print(f"    [✓] Order Enquiry content found in: {ctx_desc}")
+    dismiss_top_modals(page, "on Order Enquiry")
 
     # ── STEP 4: SET ORDER DATE = YESTERDAY ───────────────
-    print("\n[4] Setting Order Date to YESTERDAY...")
-    yesterday = datetime.now(IST) - timedelta(days=1)
-    y_str = yesterday.strftime("%d/%m/%Y")
+    y_str = vinculum_date(report_day)
+    print(f"\n[4] Setting Order Date to {y_str}...")
 
     date_result = ctx.run_js(f"""
         try {{
@@ -222,7 +316,6 @@ def main():
     """)
     print(f"    daterangepicker -> {date_result}")
     if not (date_result or "").startswith("OK"):
-        page.quit()
         fail(f"Could not set Order Date automatically to {y_str}.")
     time.sleep(1)
 
@@ -259,7 +352,6 @@ def main():
     if ok:
         print(f"    [✓] {info}")
     else:
-        page.quit()
         fail(f"Could not click Search ({info}).")
 
     time.sleep(4)
@@ -271,6 +363,16 @@ def main():
     time.sleep(2)
 
     # ── STEP 6: OPEN EXPORT DIALOG ────────────────────────
+    # The Pending Report grid only shows request times to the minute, and step 9
+    # accepts any OrderEnquiryExport requested from 60s before run start. When
+    # one process exports several dates (back-fill / retry), keep requests
+    # >= EXPORT_GAP_SECONDS apart so the previous date's file can never be
+    # picked up as this date's.
+    global _last_export_request_ts
+    gap = EXPORT_GAP_SECONDS - (time.time() - _last_export_request_ts)
+    if gap > 0:
+        print(f"\n    Waiting {int(gap)}s so this export can't be confused with the previous one...")
+        time.sleep(gap)
     try:
         run_start_epoch = int(ctx.run_js("return Date.now();"))
     except Exception:
@@ -281,7 +383,6 @@ def main():
     if ok:
         print(f"    [✓] {info}")
     else:
-        page.quit()
         fail(f"Could not click toolbar Export ({info}).")
     time.sleep(2)
 
@@ -320,7 +421,6 @@ def main():
 
     dctx, dctx_desc = find_dialog_ctx()
     if dctx is None:
-        page.quit()
         fail("Could not locate the export dialog in any context.")
     print(f"    [✓] Export dialog found in: {dctx_desc}")
     time.sleep(1)
@@ -354,7 +454,6 @@ def main():
             time.sleep(1)
 
     if inner is None:
-        page.quit()
         fail("Could not enter dynamicFieldDialogIFrame.")
 
     outer_dctx = dctx
@@ -459,97 +558,122 @@ def main():
     """)
     print(f"    Order Source -> {src_result}")
     time.sleep(1)
+    dismiss_top_modals(page, "before field selection")
 
+    # Field grid = jqGrid "dynamicFieldGrid" (multiselect, 39 rows; Order No /
+    # Extern OrderNo / Order Date come pre-selected and locked). Rows are
+    # selected with element.click() run IN the iframe: it fires jqGrid's own
+    # row-checkbox handler, so it works whatever is drawn on top of the page,
+    # and for rows scrolled outside the 380px-high iframe. The old code clicked
+    # by mouse coordinates (header "select all" toggle, then each row) and
+    # ignored the result — when those clicks did not land (2026-10-07/09) every
+    # try stayed at the 3 locked fields. The header checkbox is a TOGGLE, so it
+    # is never clicked (clicking it when all are selected would clear them).
     def read_field_state():
-        return dctx.run_js(_DIALOG_BOXES_JS + """
+        raw = dctx.run_js(_DIALOG_BOXES_JS + """
             if (!structureOK()) return JSON.stringify({total:0, checked:0, bad:'NO_GRID'});
             var fb = fieldBoxes();
-            var checked = fb.filter(function(b){ return b.checked; }).length;
-            return JSON.stringify({total: fb.length, checked: checked, bad:null});
-        """ + _DIALOG_BOXES_JS_END)
-
-    def tag_field_boxes():
-        raw = dctx.run_js(_DIALOG_BOXES_JS + """
-            if (!structureOK()) return JSON.stringify({bad:'NO_GRID'});
-            var hb = headerBox();
-            if (hb && !hb.id) hb.id = 'AUTO_HDR_BOX';
-            var fb = fieldBoxes();
-            var list = [];
-            fb.forEach(function(b, i){
-                if (!b.id) b.id = 'AUTO_FLD_' + i;
-                list.push({id: b.id, name: rowNameOf(b), checked: !!b.checked, disabled: !!b.disabled});
-            });
-            return JSON.stringify({
-                bad: null,
-                header: hb ? hb.id : null,
-                fields: list
-            });
+            var off = fb.filter(function(b){ return !b.checked; }).map(rowNameOf);
+            var sel = null, rows = null;
+            try {
+                if (window.jQuery && jQuery.fn.jqGrid) {
+                    var g = jQuery('table.ui-jqgrid-btable').first();
+                    if (g.length && g.jqGrid('getGridParam', 'multiselect')) {
+                        sel = (g.jqGrid('getGridParam', 'selarrrow') || []).length;
+                        rows = g.jqGrid('getGridParam', 'reccount');
+                    }
+                }
+            } catch (e) {}
+            return JSON.stringify({total: fb.length, checked: fb.length - off.length,
+                                   unchecked: off, jqSelected: sel, jqRows: rows, bad: null});
         """ + _DIALOG_BOXES_JS_END)
         try:
             return json.loads(raw)
         except Exception:
-            return {"bad": "PARSE", "fields": []}
+            return {"total": 0, "checked": 0, "bad": "PARSE", "unchecked": []}
 
-    def native_click(box_id):
+    def all_fields_selected(st):
+        if st.get("bad") or not st.get("total"):
+            return False
+        if st["checked"] != st["total"]:
+            return False
+        # jqGrid's own selection list is what the export reads — must agree too
+        if st.get("jqSelected") is not None and st["jqSelected"] != st["total"]:
+            return False
+        return True
+
+    def js_click_unchecked():
+        raw = dctx.run_js(_DIALOG_BOXES_JS + """
+            if (!structureOK()) return JSON.stringify({bad:'NO_GRID', clicked:0});
+            var n = 0;
+            fieldBoxes().forEach(function(b){
+                if (!b.checked && !b.disabled) { b.click(); n++; }
+            });
+            return JSON.stringify({bad:null, clicked:n});
+        """ + _DIALOG_BOXES_JS_END)
         try:
-            el = dctx.ele(f"#{box_id}", timeout=3)
-            if el:
-                el.click(by_js=False)
-                return True
+            return json.loads(raw)
         except Exception:
-            pass
-        return False
+            return {"bad": "PARSE", "clicked": 0}
 
-    def select_all_export_fields():
-        info = tag_field_boxes()
-        if info.get("bad"):
-            return f"{info['bad']}"
-        fields = info.get("fields", [])
-        if not fields:
-            return "NO_ROWS"
-
-        unchecked = [f for f in fields if not f["checked"] and not f["disabled"]]
-        if info.get("header") and unchecked:
-            native_click(info["header"])
-            time.sleep(0.8)
-
-        info2 = tag_field_boxes()
-        still_off = [f for f in info2.get("fields", []) if not f["checked"] and not f["disabled"]]
-        for f in still_off:
-            native_click(f["id"])
+    def native_click_unchecked():
+        """Fallback only: mouse-event click on each still-unchecked row box.
+        Returns how many clicks DrissionPage reports as dispatched."""
+        ids = dctx.run_js(_DIALOG_BOXES_JS + """
+            var out = [];
+            fieldBoxes().forEach(function(b, i){
+                if (!b.checked && !b.disabled) { if (!b.id) b.id = 'AUTO_FLD_' + i; out.push(b.id); }
+            });
+            return JSON.stringify(out);
+        """ + _DIALOG_BOXES_JS_END)
+        done = 0
+        for box_id in json.loads(ids or "[]"):
+            try:
+                el = dctx.ele(f"#{box_id}", timeout=3)
+                if el and el.click(by_js=False):
+                    done += 1
+            except Exception as e:
+                print(f"      native click #{box_id} failed: {e!r}")
             time.sleep(0.15)
-
-        final = tag_field_boxes()
-        flds = final.get("fields", [])
-        checked = sum(1 for f in flds if f["checked"])
-        sample = ",".join(f["name"] for f in flds[:8])
-        return f"OK|{checked}/{len(flds)} || headerNative || sample={sample}"
+        return done
 
     fields_ok = False
+    st = read_field_state()
+    print(f"    Fields before: {st.get('checked')}/{st.get('total')} checked"
+          f" (jqGrid selected {st.get('jqSelected')}/{st.get('jqRows')})")
     for attempt in range(1, 4):
-        result = select_all_export_fields()
-        print(f"    Select fields (try {attempt}) -> {result}")
-
-        if (result or "").startswith(("NO_GRID", "NO_ROWS")):
-            time.sleep(1.5)
-            continue
-
-        time.sleep(1.5)
-        try:
-            st = json.loads(read_field_state())
-        except Exception:
-            st = {"total": 0, "checked": 0, "bad": None}
-        if st.get("bad"):
-            print(f"    [!] Grid not detected ({st['bad']}) — retrying...")
-            time.sleep(1.5)
-            continue
-        if st["total"] > 0 and st["checked"] == st["total"]:
+        if all_fields_selected(st):
             fields_ok = True
             break
+        if st.get("bad"):
+            print(f"    [!] Field grid not ready ({st['bad']}) — waiting...")
+            time.sleep(1.5)
+            st = read_field_state()
+            continue
+        res = js_click_unchecked()
+        time.sleep(1)
+        st = read_field_state()
+        print(f"    Select fields (try {attempt}) JS-click {res.get('clicked')} boxes -> "
+              f"{st.get('checked')}/{st.get('total')} checked, jqGrid selected "
+              f"{st.get('jqSelected')}/{st.get('jqRows')}")
+        if all_fields_selected(st):
+            fields_ok = True
+            break
+        n = native_click_unchecked()
+        time.sleep(1)
+        st = read_field_state()
+        print(f"    Select fields (try {attempt}) native-click fallback {n} boxes -> "
+              f"{st.get('checked')}/{st.get('total')} checked")
+        if all_fields_selected(st):
+            fields_ok = True
+            break
+        dismiss_top_modals(page, "before re-trying field selection")
 
     if not fields_ok:
-        page.quit()
-        fail("Fields not fully selected — export would be rejected.")
+        print(f"    Still unchecked: {st.get('unchecked')}")
+        fail(f"Fields not fully selected ({st.get('checked')}/{st.get('total')}, jqGrid "
+             f"{st.get('jqSelected')}) — refusing to export a partial report.")
+    print(f"    [✓] All {st['total']} export fields selected.")
     time.sleep(1)
 
     print("    Clicking dialog Export...")
@@ -593,22 +717,11 @@ def main():
             break
 
     if not (tag_result or "").startswith("FOUND"):
-        page.quit()
         fail("Could not isolate the dialog Export button.")
 
     btn_id = tag_result.split("|")[1]
-    dlg_clicked = False
-    try:
-        ebtn = export_ctx.ele(f"#{btn_id}", timeout=6)
-        if ebtn:
-            ebtn.click(by_js=False)
-            dlg_clicked = True
-            print("    [✓] Native click on dialog Export.")
-    except Exception as e:
-        print(f"    Native dialog click failed: {e}")
 
-    time.sleep(2)
-    still_open = outer_dctx.run_js("""
+    _DIALOG_OPEN_JS = """
         var els = document.querySelectorAll('div,h1,h2,h3,span');
         for (var el of els){
             if ((el.innerText || '').indexOf('Select Field For Export') !== -1){
@@ -617,12 +730,43 @@ def main():
             }
         }
         return false;
-    """)
+    """
+
+    def dialog_open():
+        try:
+            return bool(outer_dctx.run_js(_DIALOG_OPEN_JS))
+        except Exception:
+            return False
+
+    dlg_clicked = False
+    try:
+        ebtn = export_ctx.ele(f"#{btn_id}", timeout=6)
+        if ebtn and ebtn.click(by_js=False):
+            dlg_clicked = True
+            print("    [✓] Native click on dialog Export.")
+    except Exception as e:
+        print(f"    Native dialog click failed: {e}")
+
+    time.sleep(2)
+    still_open = dialog_open()
     print(f"    Dialog still open after click? {still_open}")
+    if still_open:
+        # The native click did not land (same failure class as the field
+        # checkboxes) — fire the button's own click handler instead.
+        res = export_ctx.run_js(
+            f"var b = document.getElementById({json.dumps(btn_id)});"
+            " if (!b) return 'NO_BUTTON'; b.click(); return 'JS_CLICKED';")
+        print(f"    Dialog Export JS-click fallback -> {res}")
+        dlg_clicked = dlg_clicked or res == "JS_CLICKED"
+        time.sleep(3)
+        still_open = dialog_open()
+        print(f"    Dialog still open after JS click? {still_open}")
+        if still_open:
+            fail("Export dialog did not close after clicking Export — export not requested.")
 
     if not dlg_clicked:
-        page.quit()
         fail("Could not click dialog Export.")
+    _last_export_request_ts = time.time()
     time.sleep(3)
 
     # ── STEP 8: OPEN PENDING REPORT PAGE ──────────────────
@@ -743,9 +887,12 @@ def main():
         file_id = info.get("fileId", "")
         status = info.get("status", "")
         elapsed = int(time.time() - start_time)
+        if report_id and report_id in _seen_report_ids:
+            status = f"(#{report_id} belongs to an earlier date/attempt — waiting for this one)"
         print(f"[{elapsed:3d}s] {REPORT_NAME_MATCH} #{report_id}  Status: {status}")
 
         if status == "SUCCESS":
+            _seen_report_ids.add(report_id)
             print("\n[✓] SUCCESS — triggering downloadReport()...")
             pre_download_ts = time.time()
             clicked = pctx.run_js(f"""
@@ -775,7 +922,6 @@ def main():
         time.sleep(3)
 
     if not downloaded:
-        page.quit()
         fail(f"Report did not download within {MAX_WAIT_SECONDS}s.")
 
     # ── STEP 10: UPLOAD TO DRIVE + CLEAN UP ───────────────
@@ -783,14 +929,11 @@ def main():
     local_file = downloaded_file or get_latest_downloaded_file(LOCAL_DOWNLOAD_PATH, since_ts=pre_download_ts)
 
     if not local_file:
-        page.quit()
         fail(f"Could not find the downloaded file in {LOCAL_DOWNLOAD_PATH}.")
 
     print(f"    [✓] Found file: {local_file}")
-    drive_filename = "OrderEnquiry_" + yesterday.strftime("%d-%m-%Y")
+    drive_filename = drive_filename_for(report_day)
     uploaded_file_id = upload_to_drive(drive_service, local_file, drive_filename, GDRIVE_FOLDER_ID)
-
-    page.quit()
 
     if not uploaded_file_id:
         fail("Drive upload failed. Check that the folder is shared with the service account's client_email.")
@@ -806,6 +949,108 @@ def main():
     print("  [✓] SUCCESS! Order Enquiry report uploaded to Google Drive as a Sheet.")
     print(f"  Drive folder: https://drive.google.com/drive/folders/{GDRIVE_FOLDER_ID}")
     print("=" * 55)
+
+
+def existing_drive_names(drive_service, folder_id, prefix="OrderEnquiry_"):
+    """Names of the non-trashed files in the folder starting with prefix.
+    Returns None if Drive can't be listed (caller then exports everything)."""
+    names, token = set(), None
+    try:
+        while True:
+            resp = drive_service.files().list(
+                q=f"'{folder_id}' in parents and trashed=false and name contains '{prefix}'",
+                fields="nextPageToken, files(name)", pageSize=1000, pageToken=token,
+                supportsAllDrives=True, includeItemsFromAllDrives=True,
+            ).execute()
+            names.update(f["name"] for f in resp.get("files", []))
+            token = resp.get("nextPageToken")
+            if not token:
+                return names
+    except Exception as e:
+        print(f"    [!] Could not list Drive folder ({e!r}) — not skipping any date.")
+        return None
+
+
+def _env_true(name):
+    return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes", "y")
+
+
+def main():
+    validate_env()
+    os.makedirs(LOCAL_DOWNLOAD_PATH, exist_ok=True)
+
+    print("=" * 55)
+    print("  Nasher Miles - Order Enquiry Export -> Google Drive")
+    print("=" * 55)
+
+    today = datetime.now(IST).date()
+    spec = os.environ.get("REPORT_DATE", "")
+    try:
+        requested = parse_report_dates(spec, today)
+    except ReportDateError as e:
+        print(f"\n[✗] REPORT_DATE: {e}")
+        sys.exit(2)
+
+    if requested:
+        days, skip_existing = requested, _env_true("SKIP_EXISTING")
+        mode = f"requested dates ({spec.strip()})"
+    else:
+        days, skip_existing = default_window(today), True
+        mode = "catch-up window (last 3 days ending yesterday, IST)"
+
+    print("\n[0] Authenticating Google Drive API (service account)...")
+    drive_service = get_drive_service()
+    print("    [OK] Drive API ready!")
+
+    print(f"\n    Mode: {mode}")
+    print(f"    Candidate dates: {', '.join(vinculum_date(d) for d in days)}")
+    if skip_existing:
+        existing = existing_drive_names(drive_service, GDRIVE_FOLDER_ID)
+        if existing is not None:
+            have = [d for d in days if d not in pending_dates(days, existing)]
+            if have:
+                print(f"    Already in Drive (skipped): {', '.join(drive_filename_for(d) for d in have)}")
+            days = pending_dates(days, existing)
+    if not days:
+        print("\n[✓] Nothing to do — every candidate date already has its file in Drive.")
+        return
+    print(f"    Exporting: {', '.join(vinculum_date(d) for d in days)} "
+          f"(up to {MAX_ATTEMPTS} attempts each)")
+
+    results = {}
+    for day in days:
+        print("\n" + "#" * 55)
+        print(f"#  Report date {vinculum_date(day)} -> {drive_filename_for(day)}")
+        print("#" * 55)
+        attempt = 1
+        while True:
+            try:
+                run_once(drive_service, day, attempt)
+                results[day] = f"OK (attempt {attempt})"
+                break
+            except Exception as e:
+                retryable = getattr(e, "retryable", True)
+                if not isinstance(e, ExportError):
+                    traceback.print_exc()
+                print(f"\n[!] {vinculum_date(day)} attempt {attempt}/{MAX_ATTEMPTS} failed: {e}")
+                if should_retry(attempt, MAX_ATTEMPTS, retryable):
+                    print(f"    Retrying with a fresh browser in {RETRY_PAUSE_SECONDS}s...")
+                    time.sleep(RETRY_PAUSE_SECONDS)
+                    attempt += 1
+                    continue
+                results[day] = f"FAILED after {attempt} attempt(s): {e}"
+                break
+
+    print("\n" + "=" * 55)
+    print("  SUMMARY")
+    for day, res in results.items():
+        print(f"  {drive_filename_for(day)}: {res}")
+    print("=" * 55)
+    failed = [d for d, r in results.items() if r.startswith("FAILED")]
+    if failed:
+        print(f"\n[✗] {len(failed)} date(s) not exported: "
+              f"{', '.join(vinculum_date(d) for d in failed)} — re-run with report_date to back-fill.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

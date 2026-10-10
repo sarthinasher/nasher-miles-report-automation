@@ -2,13 +2,37 @@ name: Order Enquiry Report to Drive
 
 on:
   schedule:
+    # Both runs use the catch-up window: export every day of the last 3 (ending
+    # yesterday, IST) whose OrderEnquiry_DD-MM-YYYY file is missing in Drive.
+    # Normally the first run does yesterday and the second finds nothing to do;
+    # if the first failed (or GitHub delayed/skipped it), the second fills the gap.
     - cron: "35 4 * * *"
-  workflow_dispatch: {}
+    - cron: "35 9 * * *"
+  workflow_dispatch:
+    inputs:
+      report_date:
+        description: >-
+          Order date(s) to export, DD/MM/YYYY: one date (08/10/2026), a list
+          (06/10/2026,08/10/2026) or a range (06/10/2026-09/10/2026). Blank =
+          catch-up (missing days among the last 3 ending yesterday).
+        required: false
+        default: ""
+      skip_existing:
+        description: "With report_date: skip dates whose file is already in Drive (default: re-export and overwrite)"
+        required: false
+        default: false
+        type: boolean
+
+# Two runs logged in with the same Vinculum user at once kill each other's
+# session — never overlap Order Enquiry runs (queue instead).
+concurrency:
+  group: order-enquiry-report
+  cancel-in-progress: false
 
 jobs:
   run-order-enquiry-report:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repo
@@ -20,11 +44,25 @@ jobs:
           python-version: "3.11"
 
       - name: Install Python dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements.txt pytest
+
+      - name: Run tests
+        run: python -m pytest tests -q
 
       - name: Run Order Enquiry report script
         env:
           VIN_LOGIN_ID: ${{ secrets.VIN_LOGIN_ID }}
           VIN_PASSWORD: ${{ secrets.VIN_PASSWORD }}
           GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+          REPORT_DATE: ${{ inputs.report_date }}
+          SKIP_EXISTING: ${{ inputs.skip_existing }}
+          PYTHONUNBUFFERED: "1"
         run: python scripts/order_enquiry_report_to_drive.py
+
+      - name: Upload failure screenshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: order-enquiry-debug
+          path: /tmp/order_enquiry_debug
+          if-no-files-found: ignore
