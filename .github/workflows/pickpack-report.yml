@@ -1,15 +1,38 @@
-
 name: Pick Pack Report to Drive
 
 on:
   schedule:
+    # Both runs use the catch-up window (2026-10-13): export every day of the last 7
+    # (ending yesterday, IST) whose PickPackReport_DD.MM.YYYY is missing in Drive.
+    # Normally the first run does yesterday and the second finds nothing to do (no
+    # Vinculum login); if the first failed or GitHub skipped it, the second fills the gap.
     - cron: "17 3 * * *"
-  workflow_dispatch: {}
+    - cron: "17 8 * * *"
+  workflow_dispatch:
+    inputs:
+      report_date:
+        description: >-
+          Pick date(s) to export, DD/MM/YYYY: one date (27/09/2026), a list
+          (27/09/2026,11/10/2026) or a range (11/10/2026-12/10/2026). Blank =
+          catch-up (missing days among the last 7 ending yesterday).
+        required: false
+        default: ""
+      skip_existing:
+        description: "With report_date: skip dates whose file is already in Drive (default: re-export and overwrite)"
+        required: false
+        default: false
+        type: boolean
+
+# One Vinculum user for every report job: two sessions at once kill each other.
+# Shared with Order Enquiry, Sales Report, Inventory and SKU Master (a run waits).
+concurrency:
+  group: vinculum-session
+  cancel-in-progress: false
 
 jobs:
   run-pickpack-report:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repo
@@ -21,11 +44,25 @@ jobs:
           python-version: "3.11"
 
       - name: Install Python dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements.txt pytest==9.1.1
+
+      - name: Run tests
+        run: python -m pytest tests -q
 
       - name: Run Pick Pack report script
         env:
           VIN_LOGIN_ID: ${{ secrets.VIN_LOGIN_ID }}
           VIN_PASSWORD: ${{ secrets.VIN_PASSWORD }}
           GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+          REPORT_DATE: ${{ inputs.report_date }}
+          SKIP_EXISTING: ${{ inputs.skip_existing }}
+          PYTHONUNBUFFERED: "1"
         run: python scripts/pickpack_report_to_drive.py
+
+      - name: Upload failure screenshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pickpack-debug
+          path: /tmp/pickpack_debug
+          if-no-files-found: ignore

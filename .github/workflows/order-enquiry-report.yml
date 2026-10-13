@@ -2,7 +2,7 @@ name: Order Enquiry Report to Drive
 
 on:
   schedule:
-    # Both runs use the catch-up window: export every day of the last 3 (ending
+    # Both runs use the catch-up window: export every day of the last 7 (ending
     # yesterday, IST) whose OrderEnquiry_DD-MM-YYYY file is missing in Drive.
     # Normally the first run does yesterday and the second finds nothing to do;
     # if the first failed (or GitHub delayed/skipped it), the second fills the gap.
@@ -14,7 +14,7 @@ on:
         description: >-
           Order date(s) to export, DD/MM/YYYY: one date (08/10/2026), a list
           (06/10/2026,08/10/2026) or a range (06/10/2026-09/10/2026). Blank =
-          catch-up (missing days among the last 3 ending yesterday).
+          catch-up (missing days among the last 7 ending yesterday).
         required: false
         default: ""
       skip_existing:
@@ -24,8 +24,8 @@ on:
         type: boolean
 
 # Two runs logged in with the same Vinculum user at once kill each other's
-# session — never overlap. Shared with the SKU Master workflow, so neither
-# job can run while the other is logged in (a run waits instead).
+# session — never overlap. Shared with the SKU Master, Pick Pack, Sales Report and
+# Inventory workflows, so no two can be logged in at once (a run waits instead).
 concurrency:
   group: vinculum-session
   cancel-in-progress: false

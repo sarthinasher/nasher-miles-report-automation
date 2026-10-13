@@ -70,6 +70,151 @@ def dismiss_top_modals(page, where):
     return res.get("closed") or []
 
 
+# ── Login (2026-10-13) ───────────────────────────────────────
+# Every report job failed from 12-Oct with only "Login failed — check VIN_LOGIN_ID /
+# VIN_PASSWORD secrets." and a screenshot of the login page: the alert Vinculum showed
+# was accepted and thrown away, so the reason (wrong / expired password, locked user)
+# was never logged, and each job retried the login several times (risking a lock-out).
+# vinculum_login() logs the alert / on-page message and raises LoginError, which the
+# callers treat as NOT retryable for the whole run. Values are passed to JS with
+# json.dumps, so a quote or backslash in the password no longer breaks the login JS.
+LOGIN_MESSAGE_JS = """
+    return (function(){
+        var sel = ['.error', '.errorMessage', '.errormsg', '.alert', '.alert-danger',
+                   '.text-danger', '#errorMsg', '#msg', '.loginError', '.help-block',
+                   'font[color=red]', 'span[style*="red"]', 'div[style*="red"]'];
+        var out = [];
+        sel.forEach(function(s){
+            document.querySelectorAll(s).forEach(function(e){
+                var t = (e.innerText || '').replace(/\\s+/g, ' ').trim();
+                var r = e.getBoundingClientRect();
+                if (t && r.width > 0 && r.height > 0 && out.indexOf(t) < 0) out.push(t.slice(0, 200));
+            });
+        });
+        return out.join(' | ');
+    })();
+"""
+
+
+class LoginError(Exception):
+    """Vinculum refused the login. Never retried within a run."""
+
+
+def login_failure_message(alert_text, page_text, login_id):
+    """One log line saying what Vinculum said and what to do about it."""
+    alert_text = (alert_text or "").strip()
+    page_text = (page_text or "").strip()
+    said = "; ".join(p for p in (f'alert "{alert_text}"' if alert_text else "",
+                                 f'page "{page_text}"' if page_text else "") if p)
+    said = said or "no message shown, still on the login page"
+    low = f"{alert_text} {page_text}".lower()
+    if any(k in low for k in ("expire", "change your password", "change password", "reset")):
+        hint = ("the password has EXPIRED - log in once by hand as this user, set a new "
+                "password, then update the VIN_PASSWORD secret")
+    elif any(k in low for k in ("lock", "disabled", "inactive", "deactivat", "blocked", "suspend")):
+        hint = ("the user is LOCKED / DISABLED in Vinculum - ask the Vinculum admin to "
+                "unlock it, or put another user in VIN_LOGIN_ID / VIN_PASSWORD")
+    elif any(k in low for k in ("invalid", "incorrect", "wrong", "not match", "not valid")):
+        hint = "Vinculum rejected the user / password - update VIN_LOGIN_ID / VIN_PASSWORD"
+    elif any(k in low for k in ("already logged", "another session", "concurrent")):
+        hint = "the user has another active session"
+    else:
+        hint = ("check VIN_LOGIN_ID / VIN_PASSWORD - log in by hand as this user to see "
+                "what Vinculum asks for")
+    return (f"Vinculum login failed for user '{login_id}': {said} -> {hint}. "
+            f"Not retried this run (repeated failed logins can lock the user).")
+
+
+def vinculum_login(page, base, login_id, password, org_id=""):
+    """Logs in on the eRetail login page. Raises LoginError with Vinculum's reason."""
+    page.get(f"{base}/eRetailLogin.action?popup=true")
+    time.sleep(4)
+    for selector in ("[name=userOrgId]", "[name=userName]", "[id=password]"):
+        page.run_js(f"var e = document.querySelector({json.dumps(selector)}); "
+                    f"if (e) e.removeAttribute('readonly');")
+    time.sleep(1)
+    values = [("[name=userName]", login_id), ("[id=password]", password)]
+    if org_id:
+        values.insert(0, ("[name=userOrgId]", org_id))
+    for selector, value in values:
+        page.run_js(f"document.querySelector({json.dumps(selector)}).value = {json.dumps(value)};")
+    time.sleep(1)
+    page.run_js("document.querySelector('[name=Login][type=submit]').click()")
+    time.sleep(3)
+
+    alerts = []
+    for _ in range(2):            # e.g. "already logged in - continue?" then a notice
+        try:
+            try:
+                text = page.handle_alert(accept=True, timeout=3)
+            except TypeError:                     # older DrissionPage: no timeout kw
+                text = page.handle_alert(accept=True)
+        except Exception:
+            text = None
+        if not text:
+            break
+        alerts.append(str(text))
+        time.sleep(2)
+    try:
+        ok = page.ele("xpath://button[contains(text(),'OK')]", timeout=3)
+        if ok:
+            ok.click()
+            time.sleep(2)
+    except Exception:
+        pass
+    time.sleep(4)
+
+    if "login" in (page.url or "").lower():
+        try:
+            page_text = page.run_js(LOGIN_MESSAGE_JS) or ""
+        except Exception:
+            page_text = ""
+        raise LoginError(login_failure_message(" | ".join(alerts), page_text, login_id))
+    if alerts:
+        print(f"    Vinculum said at login (accepted): {' | '.join(alerts)}")
+    print("[✓] Login successful!")
+
+
+# ── Report date (2026-10-13) ─────────────────────────────────
+# Same daterangepicker call that the Order Enquiry export has used since 10-Oct, so a
+# report can be exported for ANY past day (catch-up / back-fill), not only "Yesterday".
+def set_date_range_js(day_str):
+    d = json.dumps(day_str)
+    return f"""
+        try {{
+            if (!window.jQuery) return "NO_JQUERY";
+            if (!window.moment) return "NO_MOMENT";
+            var $ = window.jQuery, cands = [];
+            $('input').each(function() {{ if ($(this).data('daterangepicker')) cands.push(this); }});
+            if (!cands.length) return "NO_DATE_INPUT";
+            var vis = cands.filter(function(e) {{ return e.offsetWidth > 0; }});
+            var target = vis.filter(function(e) {{ return (e.value || '').indexOf('/') !== -1; }})[0]
+                         || vis[0] || cands[0];
+            var drp = $(target).data('daterangepicker');
+            drp.setStartDate(moment({d}, "DD/MM/YYYY").startOf('day'));
+            drp.setEndDate(moment({d}, "DD/MM/YYYY").endOf('day'));
+            $(target).trigger('apply.daterangepicker', drp);
+            return "OK|" + drp.startDate.format('DD/MM/YYYY') + "|" +
+                   drp.endDate.format('DD/MM/YYYY') + "|" + (target.value || '');
+        }} catch (e) {{ return "ERR|" + e.toString(); }}
+    """
+
+
+def date_range_ok(result, day_str):
+    """True if set_date_range_js reported start == end == day_str."""
+    parts = str(result or "").split("|")
+    return len(parts) >= 3 and parts[0] == "OK" and parts[1] == day_str and parts[2] == day_str
+
+
+def set_report_date(page, day_str):
+    """Sets the report's date picker to day_str (DD/MM/YYYY). Returns (ok, detail)."""
+    try:
+        res = page.run_js(set_date_range_js(day_str))
+    except Exception as e:
+        res = f"ERR|{e!r}"
+    return date_range_ok(res, day_str), res
+
+
 # ── Browser / debug ──────────────────────────────────────────
 def launch_browser(download_path):
     """Headless Chrome on a fresh port + profile, so a retry never reuses a

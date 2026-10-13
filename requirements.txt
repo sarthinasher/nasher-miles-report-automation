@@ -1,5 +1,10 @@
-DrissionPage>=4.0.0
-google-auth>=2.0.0
-google-api-python-client>=2.0.0
-google-auth-httplib2>=0.1.0
-requests>=2.31.0
+# Pinned 2026-10-13 to the versions of the last green runs (11-Oct, Python 3.11).
+# Upgrade deliberately: bump, run pytest, run one job by hand, then commit.
+DrissionPage==4.1.1.4
+google-auth==2.61.0
+google-api-python-client==2.201.0
+google-api-core==2.42.0
+google-auth-httplib2==0.4.4
+httplib2==0.32.0
+protobuf==7.36.2
+requests==2.34.2

@@ -12,7 +12,17 @@ from datetime import datetime, timedelta
 
 DATE_FMT = "%d/%m/%Y"          # what the workflow input and Vinculum's date picker use
 MAX_RANGE_DAYS = 31            # refuse accidental huge back-fills (one export per day)
-DEFAULT_LOOKBACK_DAYS = 3      # scheduled runs: yesterday + the 2 days before it
+# Scheduled runs: yesterday + the 6 days before it (only days whose file is missing in
+# Drive are exported). Was 3; raised 2026-10-13 so a multi-day outage (e.g. the Vinculum
+# login failing from 12-Oct) is back-filled automatically once it is fixed.
+DEFAULT_LOOKBACK_DAYS = 7
+
+# Drive file name per report (prefix + report date in fmt). The REPORT date, never the
+# run date. Consumers: GT Full Flow FMS (nasher-fms-automation) and the Apps Script
+# Sales Master consolidation read these exact names.
+ORDER_ENQUIRY_NAME = ("OrderEnquiry_", "%d-%m-%Y")
+PICK_PACK_NAME = ("PickPackReport_", "%d.%m.%Y")
+SALES_REPORT_NAME = ("", "%d.%m.%Y")
 
 
 class ReportDateError(ValueError):
@@ -83,18 +93,40 @@ def default_window(today, lookback_days=DEFAULT_LOOKBACK_DAYS):
     return [today - timedelta(days=i) for i in range(lookback_days, 0, -1)]
 
 
-def drive_filename(report_day, prefix="OrderEnquiry_"):
-    """OrderEnquiry_DD-MM-YYYY for the REPORT date (not the run date)."""
-    return prefix + report_day.strftime("%d-%m-%Y")
+def drive_filename(report_day, prefix="OrderEnquiry_", fmt="%d-%m-%Y"):
+    """prefix + report date (default OrderEnquiry_DD-MM-YYYY) for the REPORT date."""
+    return prefix + report_day.strftime(fmt)
 
 
 def vinculum_date(report_day):
     return report_day.strftime(DATE_FMT)
 
 
-def pending_dates(days, existing_names, prefix="OrderEnquiry_"):
+def pending_dates(days, existing_names, prefix="OrderEnquiry_", fmt="%d-%m-%Y"):
     """Drops the days whose Drive file already exists (existing_names: set of names)."""
-    return [d for d in days if drive_filename(d, prefix) not in existing_names]
+    return [d for d in days if drive_filename(d, prefix, fmt) not in existing_names]
+
+
+def dates_to_export(spec, today, existing_names, name=ORDER_ENQUIRY_NAME,
+                    lookback_days=DEFAULT_LOOKBACK_DAYS, skip_existing_requested=False):
+    """(dates, mode text) for one run.
+
+    spec blank -> catch-up: the lookback_days days ending yesterday whose file is not in
+                  existing_names (None = Drive not listable -> export all of them).
+    spec given -> exactly those dates (parse_report_dates), minus existing files only
+                  when skip_existing_requested.
+    Raises ReportDateError for a bad spec."""
+    prefix, fmt = name
+    requested = parse_report_dates(spec, today)
+    if requested:
+        days, skip = requested, skip_existing_requested
+        mode = f"requested dates ({spec.strip()})"
+    else:
+        days, skip = default_window(today, lookback_days), True
+        mode = f"catch-up window (last {lookback_days} days ending yesterday, IST)"
+    if skip and existing_names is not None:
+        days = pending_dates(days, existing_names, prefix, fmt)
+    return days, mode
 
 
 def should_retry(attempt, max_attempts, error_retryable=True):

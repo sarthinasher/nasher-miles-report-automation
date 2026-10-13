@@ -11,7 +11,7 @@ downloadReport() -> upload to Google Drive as OrderEnquiry_DD-MM-YYYY
 (the REPORT date, not the run date).
 
 Which dates (see common/report_dates.py):
-  REPORT_DATE unset/blank -> catch-up: the last 3 days ending yesterday (IST)
+  REPORT_DATE unset/blank -> catch-up: the last 7 days ending yesterday (IST)
                              whose file is NOT yet in Drive (normally just yesterday;
                              a day lost to a failed run is picked up by the next run).
   REPORT_DATE=08/10/2026 | 06/10/2026,08/10/2026 | 06/10/2026-09/10/2026
@@ -38,12 +38,13 @@ from common.drive_utils import (
     get_drive_service, upload_to_drive, get_latest_downloaded_file, list_file_names,
 )
 from common.report_dates import (
-    ReportDateError, default_window, parse_report_dates, pending_dates,
+    DEFAULT_LOOKBACK_DAYS, ReportDateError, default_window, parse_report_dates, pending_dates,
     should_retry, vinculum_date,
 )
 from common.report_dates import drive_filename as drive_filename_for
 from common.vinculum_ui import (
-    dismiss_top_modals, request_dialog_export, select_all_export_fields,
+    LoginError, dismiss_top_modals, request_dialog_export, select_all_export_fields,
+    vinculum_login,
 )
 from common.vinculum_ui import launch_browser as _launch_browser
 from common.vinculum_ui import save_debug_screenshot as _save_debug_screenshot
@@ -127,39 +128,8 @@ def _run_steps(page, drive_service, report_day):
     """Steps 2-10 for one report date in an already-launched browser."""
     # ── STEP 2: LOGIN ────────────────────────────────────
     print("\n[2] Logging in...")
-    page.get(f"{BASE}/eRetailLogin.action?popup=true")
-    time.sleep(4)
-
-    page.run_js("document.querySelector('[name=userOrgId]').removeAttribute('readonly')")
-    page.run_js("document.querySelector('[name=userName]').removeAttribute('readonly')")
-    page.run_js("document.querySelector('[id=password]').removeAttribute('readonly')")
-    time.sleep(1)
-
-    if ORG_ID:
-        page.run_js(f"document.querySelector('[name=userOrgId]').value = '{ORG_ID}'")
-    page.run_js(f"document.querySelector('[name=userName]').value = '{LOGIN_ID}'")
-    page.run_js(f"document.querySelector('[id=password]').value = '{PASSWORD}'")
-    time.sleep(1)
-    page.run_js("document.querySelector('[name=Login][type=submit]').click()")
-    time.sleep(3)
-
-    try:
-        page.handle_alert(accept=True)
-        time.sleep(2)
-    except Exception:
-        pass
-    try:
-        ok = page.ele("xpath://button[contains(text(),'OK')]", timeout=3)
-        if ok:
-            ok.click()
-            time.sleep(2)
-    except Exception:
-        pass
-
-    time.sleep(4)
-    if "login" in page.url.lower():
-        fail("Login failed — check VIN_LOGIN_ID / VIN_PASSWORD secrets.")
-    print("[✓] Login successful!")
+    # LoginError (with Vinculum's reason) stops the whole run: see main().
+    vinculum_login(page, BASE, LOGIN_ID, PASSWORD, ORG_ID)
     dismiss_top_modals(page, "after login")
 
     # ── SHARED: locate the frame hosting a marker text ───
@@ -685,7 +655,7 @@ def main():
         mode = f"requested dates ({spec.strip()})"
     else:
         days, skip_existing = default_window(today), True
-        mode = "catch-up window (last 3 days ending yesterday, IST)"
+        mode = f"catch-up window (last {DEFAULT_LOOKBACK_DAYS} days ending yesterday, IST)"
 
     print("\n[0] Authenticating Google Drive API (service account)...")
     drive_service = get_drive_service()
@@ -707,7 +677,11 @@ def main():
           f"(up to {MAX_ATTEMPTS} attempts each)")
 
     results = {}
+    login_failed = None
     for day in days:
+        if login_failed:
+            results[day] = "FAILED: not run (Vinculum login failed)"
+            continue
         print("\n" + "#" * 55)
         print(f"#  Report date {vinculum_date(day)} -> {drive_filename_for(day)}")
         print("#" * 55)
@@ -716,6 +690,12 @@ def main():
             try:
                 run_once(drive_service, day, attempt)
                 results[day] = f"OK (attempt {attempt})"
+                break
+            except LoginError as e:
+                # Not retried, other dates not tried: repeated failed logins can lock the user.
+                print(f"\n[✗] {e}")
+                results[day] = f"FAILED: {e}"
+                login_failed = e
                 break
             except Exception as e:
                 retryable = getattr(e, "retryable", True)

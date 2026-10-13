@@ -2,8 +2,17 @@ name: Sync Sales to SharePoint
 
 on:
   schedule:
+    # Mirrors yesterday's (IST) Sales file BY NAME (2026-10-13). The second run picks it
+    # up if the Sales export (incl. its 08:40 UTC catch-up) landed after the first.
     - cron: "5 4 * * *"
-  workflow_dispatch: {}
+    - cron: "5 9 * * *"
+  workflow_dispatch:
+    inputs:
+      report_date:
+        description: >-
+          Invoice date(s) to mirror, DD/MM/YYYY (one, a list or a range). Blank = yesterday.
+        required: false
+        default: ""
 
 jobs:
   sync-sales-to-sharepoint:
@@ -28,4 +37,5 @@ jobs:
           SP_CLIENT_ID: ${{ secrets.SP_CLIENT_ID }}
           SP_TENANT_ID: ${{ secrets.SP_TENANT_ID }}
           SP_CLIENT_SECRET: ${{ secrets.SP_CLIENT_SECRET }}
+          REPORT_DATE: ${{ inputs.report_date }}
         run: python scripts/sync_sales_to_sharepoint.py

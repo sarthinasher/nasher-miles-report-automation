@@ -5,6 +5,12 @@ on:
     - cron: "9 4 * * *"
   workflow_dispatch: {}
 
+# One Vinculum user for every report job: two sessions at once kill each other
+# (a run waits; note GitHub keeps only ONE waiting run per group).
+concurrency:
+  group: vinculum-session
+  cancel-in-progress: false
+
 jobs:
   run-inventory-report:
     runs-on: ubuntu-latest

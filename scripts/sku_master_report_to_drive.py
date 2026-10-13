@@ -40,8 +40,8 @@ from common.drive_utils import (
 from common.report_dates import should_retry, weekly_file_present
 from common.report_dates import drive_filename as drive_filename_for
 from common.vinculum_ui import (
-    dismiss_top_modals, launch_browser, request_dialog_export,
-    save_debug_screenshot, select_all_export_fields,
+    LoginError, dismiss_top_modals, launch_browser, request_dialog_export,
+    save_debug_screenshot, select_all_export_fields, vinculum_login,
 )
 
 # ── SETTINGS ──────────────────────────────────────────────
@@ -110,39 +110,10 @@ def _run_steps(page, drive_service, run_day):
     """Steps 2-9 in an already-launched browser."""
     # ── STEP 2: LOGIN ────────────────────────────────────
     print("\n[2] Logging in...")
-    page.get(f"{BASE}/eRetailLogin.action?popup=true")
-    time.sleep(4)
-
-    page.run_js("document.querySelector('[name=userOrgId]').removeAttribute('readonly')")
-    page.run_js("document.querySelector('[name=userName]').removeAttribute('readonly')")
-    page.run_js("document.querySelector('[id=password]').removeAttribute('readonly')")
-    time.sleep(1)
-
-    if ORG_ID:
-        page.run_js(f"document.querySelector('[name=userOrgId]').value = '{ORG_ID}'")
-    page.run_js(f"document.querySelector('[name=userName]').value = '{LOGIN_ID}'")
-    page.run_js(f"document.querySelector('[id=password]').value = '{PASSWORD}'")
-    time.sleep(1)
-    page.run_js("document.querySelector('[name=Login][type=submit]').click()")
-    time.sleep(3)
-
     try:
-        page.handle_alert(accept=True)
-        time.sleep(2)
-    except Exception:
-        pass
-    try:
-        ok = page.ele("xpath://button[contains(text(),'OK')]", timeout=3)
-        if ok:
-            ok.click()
-            time.sleep(2)
-    except Exception:
-        pass
-
-    time.sleep(4)
-    if "login" in page.url.lower():
-        fail("Login failed — check VIN_LOGIN_ID / VIN_PASSWORD secrets.")
-    print("[✓] Login successful!")
+        vinculum_login(page, BASE, LOGIN_ID, PASSWORD, ORG_ID)
+    except LoginError as e:
+        fail(str(e), retryable=False)   # never retried: repeated failed logins can lock the user
     dismiss_top_modals(page, "after login")
 
     # ── SHARED: locate the frame hosting a marker text ───

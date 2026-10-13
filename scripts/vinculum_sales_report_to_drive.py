@@ -4,9 +4,17 @@ Nasher Miles eRetail - MIS Sales Report -> Google Drive Uploader
 CI / GitHub Actions version. Headless Chrome, all secrets from env vars,
 Drive auth via service account (see common/drive_utils.py).
 
-Logs in -> Selects Sales Report -> Sets Date = Yesterday -> Exports ->
-Waits for SUCCESS -> Downloads -> Uploads to Drive as a native Google Sheet
--> deletes the local temp copy.
+Logs in -> Selects Sales Report -> Sets Date = REPORT DATE -> Exports ->
+Waits for a NEW report SUCCESS -> Downloads -> Uploads to Drive as a native Google
+Sheet named DD.MM.YYYY (the REPORT = invoice date) -> deletes the local temp copy.
+Read by the Apps Script Sales Master consolidation and (since 2026-10-13) directly by
+the GT Full Flow FMS.
+
+Which dates (2026-10-13, common/daily_export.py): REPORT_DATE blank -> every day of
+the last 7 (ending yesterday, IST) whose file is missing in Drive (normally just
+yesterday); REPORT_DATE=11/10/2026 | 11/10/2026-12/10/2026 -> exactly those days.
+Before, only "Yesterday" was exported, named from the runner's UTC date, and a failed
+run lost the day.
 
 Run locally for testing:
     VIN_LOGIN_ID=Sonali VIN_PASSWORD=... GDRIVE_SERVICE_ACCOUNT_JSON='{...}' \
@@ -18,26 +26,29 @@ import os
 import time
 import json
 import subprocess
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from DrissionPage import ChromiumPage, ChromiumOptions
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from common.drive_utils import get_drive_service, upload_to_drive, get_latest_downloaded_file
+from common.drive_utils import (
+    get_drive_service, upload_to_drive, get_latest_downloaded_file, list_file_names,
+)
+from common import daily_export
+from common.report_dates import SALES_REPORT_NAME, drive_filename, vinculum_date
+from common.vinculum_ui import (
+    dismiss_top_modals, save_debug_screenshot, set_report_date, vinculum_login,
+)
 
 # ── SETTINGS ──────────────────────────────────────────────
 LOGIN_ID = os.environ.get("VIN_LOGIN_ID")
 PASSWORD = os.environ.get("VIN_PASSWORD")
 ORG_ID   = os.environ.get("VIN_ORG_ID", "")
 
-# Date options: "Yesterday" / "Last 7 Days" / "Last 30 Days" / "This Month" / "Last Month" / "Custom"
-DATE_OPTION = "Yesterday"
-
-CUSTOM_FROM = (datetime.today() - timedelta(days=2)).strftime("%d/%m/%Y")
-CUSTOM_TO   = datetime.today().strftime("%d/%m/%Y")
-
 LOCAL_DOWNLOAD_PATH = "/tmp/vinculum_sales_downloads"
-MAX_WAIT_SECONDS = 120
+DEBUG_DIR = os.environ.get("SALES_DEBUG_DIR", "/tmp/vinculum_sales_debug")
+MAX_WAIT_SECONDS = 240
+IST = timezone(timedelta(hours=5, minutes=30))   # India: no DST
 
 GDRIVE_FOLDER_ID = os.environ.get(
     "VINCULUM_SALES_DRIVE_FOLDER_ID", "1iL94fl0nUOxZ_pEWH_AuxnqBYsYjsjt_"
@@ -46,9 +57,17 @@ GDRIVE_FOLDER_ID = os.environ.get(
 BASE = "https://nashermiles.vineretail.com/eRetailWeb"
 
 
-def fail(message, code=1):
+# Pending-report ids already used (or already there before this run's request).
+_seen_report_ids = set()
+
+
+class ExportError(Exception):
+    quiet = True
+
+
+def fail(message):
     print(f"\n[✗] {message}")
-    sys.exit(code)
+    raise ExportError(message)
 
 
 def validate_env():
@@ -58,7 +77,8 @@ def validate_env():
         ("GDRIVE_SERVICE_ACCOUNT_JSON", os.environ.get("GDRIVE_SERVICE_ACCOUNT_JSON")),
     ] if not val]
     if missing:
-        fail(f"Missing required environment variables/secrets: {', '.join(missing)}")
+        print(f"\n[✗] Missing required environment variables/secrets: {', '.join(missing)}")
+        sys.exit(1)
 
 
 def kill_stale_chrome():
@@ -140,68 +160,107 @@ def launch_browser(max_attempts=3):
     raise last_err
 
 
-def main():
-    validate_env()
-    os.makedirs(LOCAL_DOWNLOAD_PATH, exist_ok=True)
+TOP_REPORT_JS = """
+    try {
+        var rows = document.querySelectorAll('tr[role="row"]');
+        for(var row of rows) {
+            var cells = row.querySelectorAll('td');
+            if(cells.length > 2) {
+                var reportId   = cells[0] ? cells[0].innerText.trim() : '';
+                var status     = cells[1] ? cells[1].innerText.trim() : '';
+                var reportName = cells[3] ? cells[3].innerText.trim() : '';
+                if(reportId && status) {
+                    return JSON.stringify({id: reportId, status: status, name: reportName});
+                }
+            }
+        }
+        return JSON.stringify({id:'', status:'NOT_FOUND', name:''});
+    } catch(e) {
+        return JSON.stringify({id:'', status:'ERROR_READING', name:e.message});
+    }
+"""
 
-    print("=" * 55)
-    print("  Nasher Miles - MIS Sales Report -> Google Drive")
-    print(f"  Date: {DATE_OPTION}")
-    print("=" * 55)
 
-    print("\n[0] Authenticating Google Drive API (service account)...")
-    drive_service = get_drive_service()
-    print("    [OK] Drive API ready!")
+def read_top_report(page):
+    try:
+        return json.loads(page.run_js(TOP_REPORT_JS) or "{}")
+    except Exception:
+        return {}
 
+
+def set_yesterday_range(page):
+    """The pre-2026-10-13 path ("Yesterday" range + Apply), kept as a fallback."""
+    page.run_js("""
+        var inputs = Array.from(document.querySelectorAll('input[type=text]'))
+                          .filter(function(el) {
+                              return el.name !== 'daterangepicker_start' &&
+                                     el.name !== 'daterangepicker_end' &&
+                                     el.offsetWidth > 0;
+                          });
+        if(inputs.length > 0) {
+            inputs[0].focus();
+            inputs[0].click();
+            try { $(inputs[0]).trigger('click'); } catch(e){}
+        }
+    """)
+    time.sleep(2)
+    clicked = page.run_js("""
+        var lis = document.querySelectorAll('.ranges ul li, .ranges li');
+        for(var li of lis) { if(li.innerText.trim() === 'Yesterday') { li.click(); return 'Clicked: Yesterday'; } }
+        var items = document.querySelectorAll('[data-range-key]');
+        for(var item of items) { if(item.getAttribute('data-range-key') === 'Yesterday') { item.click(); return 'Clicked by key: Yesterday'; } }
+        return 'NOT_FOUND';
+    """)
+    time.sleep(1)
+    page.run_js("""
+        var btn = document.querySelector('.applyBtn');
+        if(btn) { btn.click(); return; }
+        var ab = [...document.querySelectorAll('button')].find(b => (b.innerText||'').trim() === 'Apply');
+        if(ab) ab.click();
+    """)
+    time.sleep(2)
+    return clicked
+
+
+def export_day(drive_service, day, attempt):
+    """One attempt for one report (invoice) date: fresh browser -> export -> upload."""
     print("\n[1] Launching headless browser...")
     page = launch_browser()
-
     page.set.download_path(LOCAL_DOWNLOAD_PATH)
+    try:
+        _export_steps(page, drive_service, day)
+    except Exception:
+        save_debug_screenshot(page, DEBUG_DIR, f"fail_{day:%Y-%m-%d}_attempt{attempt}.png")
+        raise
+    finally:
+        try:
+            page.quit()
+        except Exception:
+            pass
 
-    # ── STEP 2: LOGIN ────────────────────────────────────
+
+def _export_steps(page, drive_service, day):
+    day_str = vinculum_date(day)
+    yesterday = datetime.now(IST).date() - timedelta(days=1)
+
+    # ── STEP 2: LOGIN (LoginError stops the whole run) ───
     print("\n[2] Logging in...")
-    page.get(f"{BASE}/eRetailLogin.action?popup=true")
+    vinculum_login(page, BASE, LOGIN_ID, PASSWORD, ORG_ID)
+    dismiss_top_modals(page, "after login")
+
+    # ── STEP 3: NOTE THE NEWEST PENDING REPORT BEFORE OUR REQUEST ─
+    page.get(f"{BASE}/pendingDisplay")
     time.sleep(4)
+    before = read_top_report(page)
+    if before.get("id"):
+        _seen_report_ids.add(before["id"])
+    print(f"    Newest pending report before this request: #{before.get('id', '')}")
 
-    page.run_js("document.querySelector('[name=userOrgId]').removeAttribute('readonly')")
-    page.run_js("document.querySelector('[name=userName]').removeAttribute('readonly')")
-    page.run_js("document.querySelector('[id=password]').removeAttribute('readonly')")
-    time.sleep(1)
-
-    if ORG_ID:
-        page.run_js(f"document.querySelector('[name=userOrgId]').value = '{ORG_ID}'")
-    page.run_js(f"document.querySelector('[name=userName]').value = '{LOGIN_ID}'")
-    page.run_js(f"document.querySelector('[id=password]').value = '{PASSWORD}'")
-    time.sleep(1)
-    page.run_js("document.querySelector('[name=Login][type=submit]').click()")
-    time.sleep(3)
-
-    try:
-        page.handle_alert(accept=True)
-        time.sleep(2)
-    except Exception:
-        pass
-    try:
-        ok = page.ele("xpath://button[contains(text(),'OK')]", timeout=3)
-        if ok:
-            ok.click()
-            time.sleep(2)
-    except Exception:
-        pass
-
-    time.sleep(4)
-    if "login" in page.url.lower():
-        page.quit()
-        fail("Login failed — check VIN_LOGIN_ID / VIN_PASSWORD secrets.")
-    print("[✓] Login successful!")
-
-    # ── STEP 3: OPEN MIS REPORTS ──────────────────────────
-    print("\n[3] Opening MIS Reports...")
+    # ── STEP 4: OPEN MIS REPORTS + SELECT SALES REPORT ────
+    print("\n[4] Opening MIS Reports and selecting Sales Report...")
     page.get(f"{BASE}/displayCategoryAnalysisBS?posMenu=false")
     time.sleep(5)
-
-    # ── STEP 4: SELECT SALES REPORT ───────────────────────
-    print("\n[4] Selecting Sales Report...")
+    dismiss_top_modals(page, "on MIS Reports")
     result = page.run_js("""
         var targetSelect = null, targetValue = null;
         document.querySelectorAll('select').forEach(function(s) {
@@ -218,89 +277,24 @@ def main():
         return '[!] Not found';
     """)
     print(f"    {result}")
+    if "Not found" in str(result):
+        fail("'Sales Report' not found in the MIS report list.")
     time.sleep(2)
 
-    # ── STEP 5: SET DATE ───────────────────────────────────
-    print(f"\n[5] Setting date: {DATE_OPTION}...")
-
-    page.run_js("""
-        var inputs = Array.from(document.querySelectorAll('input[type=text]'))
-                          .filter(function(el) {
-                              return el.name !== 'daterangepicker_start' &&
-                                     el.name !== 'daterangepicker_end' &&
-                                     el.offsetWidth > 0;
-                          });
-        if(inputs.length > 0) {
-            inputs[0].focus();
-            inputs[0].click();
-            try { $(inputs[0]).trigger('click'); } catch(e){}
-        }
-    """)
-    time.sleep(2)
-
-    if DATE_OPTION == "Custom":
-        page.run_js("""
-            var lis = document.querySelectorAll('.ranges ul li, .ranges li');
-            for(var li of lis) {
-                if(li.innerText.trim() === 'Custom Range') { li.click(); break; }
-            }
-        """)
-        time.sleep(1)
-        page.run_js(f"""
-            var s = document.querySelector('input[name="daterangepicker_start"]');
-            var e = document.querySelector('input[name="daterangepicker_end"]');
-            if(s) {{ s.value = '{CUSTOM_FROM}'; s.dispatchEvent(new Event('change')); }}
-            if(e) {{ e.value = '{CUSTOM_TO}';   e.dispatchEvent(new Event('change')); }}
-        """)
-        time.sleep(1)
-        print(f"    [✓] Custom: {CUSTOM_FROM} -> {CUSTOM_TO}")
-    else:
-        clicked = page.run_js(f"""
-            var lis = document.querySelectorAll('.ranges ul li, .ranges li');
-            for(var li of lis) {{
-                if(li.innerText.trim() === '{DATE_OPTION}') {{
-                    li.click();
-                    return '[✓] Clicked: {DATE_OPTION}';
-                }}
-            }}
-            var items = document.querySelectorAll('[data-range-key]');
-            for(var item of items) {{
-                if(item.getAttribute('data-range-key') === '{DATE_OPTION}') {{
-                    item.click();
-                    return '[✓] Clicked by key: {DATE_OPTION}';
-                }}
-            }}
-            var avail = [];
-            document.querySelectorAll('.ranges ul li,.ranges li').forEach(function(li){{avail.push(li.innerText.trim());}});
-            return '[!] Not found. Available: ' + avail.join(', ');
-        """)
-        print(f"    {clicked}")
-
+    # ── STEP 5: SET DATE = REPORT DATE ────────────────────
+    print(f"\n[5] Setting date: {day_str}...")
+    ok, detail = set_report_date(page, day_str)
+    print(f"    daterangepicker -> {detail}")
+    if not ok:
+        if day == yesterday:
+            print(f"    [!] Could not set {day_str} directly — using the 'Yesterday' range.")
+            print(f"    {set_yesterday_range(page)}")
+        else:
+            fail(f"Could not set the Sales Report date to {day_str} ({detail}).")
     time.sleep(1)
-
-    apply_result = page.run_js("""
-        var btn = document.querySelector('.applyBtn');
-        if(btn) { btn.click(); return '[✓] Apply clicked'; }
-        var btns = [...document.querySelectorAll('button')];
-        var ab = btns.find(b => (b.innerText||'').trim() === 'Apply');
-        if(ab) { ab.click(); return '[✓] Apply clicked by text'; }
-        return '[!] Apply button not found';
-    """)
-    print(f"    {apply_result}")
-    time.sleep(2)
-
-    date_val = page.run_js("""
-        var inputs = Array.from(document.querySelectorAll('input[type=text]'))
-                          .filter(el => el.name !== 'daterangepicker_start' &&
-                                        el.name !== 'daterangepicker_end' &&
-                                        el.offsetWidth > 0);
-        return inputs.length > 0 ? inputs[0].value : 'not found';
-    """)
-    print(f"    Date set to: {date_val}")
 
     # ── STEP 6: CLICK EXPORT ───────────────────────────────
     print("\n[6] Clicking Export...")
-    time.sleep(1)
     try:
         btn = page.ele("xpath://button[contains(.,'Export')] | //a[contains(.,'Export')]", timeout=5)
         if btn:
@@ -315,56 +309,28 @@ def main():
             if(b) b.click();
         """)
         print("    [✓] Export JS clicked")
-
     time.sleep(3)
 
     # ── STEP 7: PENDING REPORTS QUEUE ──────────────────────
-    print("\n[7] Navigating to Pending Reports page...")
+    print(f"\n[7] Waiting in Pending Reports for a NEW report (max {MAX_WAIT_SECONDS}s)...")
     page.get(f"{BASE}/pendingDisplay")
     time.sleep(4)
-    print(f"    URL: {page.url}")
 
-    print(f"\n[8] Waiting for report (max {MAX_WAIT_SECONDS}s)...")
     start_time = time.time()
     downloaded = False
     pre_download_ts = None
-
     while time.time() - start_time < MAX_WAIT_SECONDS:
-        status_info = page.run_js("""
-            try {
-                var rows = document.querySelectorAll('tr[role="row"]');
-                for(var row of rows) {
-                    var cells = row.querySelectorAll('td');
-                    if(cells.length > 2) {
-                        var reportId   = cells[0] ? cells[0].innerText.trim() : '';
-                        var status     = cells[1] ? cells[1].innerText.trim() : '';
-                        var reportName = cells[3] ? cells[3].innerText.trim() : '';
-                        if(reportId && status) {
-                            return JSON.stringify({id: reportId, status: status, name: reportName});
-                        }
-                    }
-                }
-                return JSON.stringify({id:'', status:'NOT_FOUND', name:''});
-            } catch(e) {
-                return JSON.stringify({id:'', status:'ERROR_READING', name:e.message});
-            }
-        """)
-
-        try:
-            info = json.loads(status_info)
-        except Exception:
-            info = {}
-        status = info.get('status', '')
-        report_id = info.get('id', '')
-        report_name = info.get('name', '')
+        info = read_top_report(page)
+        status, report_id, report_name = (info.get("status", ""), info.get("id", ""),
+                                          info.get("name", ""))
         elapsed = int(time.time() - start_time)
         print(f"    [{elapsed:3d}s] Report #{report_id} | {report_name} | Status: {status}")
-
-        if status == "SUCCESS":
+        if report_id and report_id in _seen_report_ids:
+            print("       (an earlier report — waiting for this request's one)")
+        elif status == "SUCCESS":
             print("\n    [✓] Report is ready! Downloading...")
             pre_download_ts = time.time()
             time.sleep(1)
-
             dl_result = page.run_js("""
                 var rows = document.querySelectorAll('tr[role="row"]');
                 for(var row of rows) {
@@ -390,38 +356,36 @@ def main():
                 return 'No SUCCESS row found';
             """)
             print(f"    {dl_result}")
+            if report_id:
+                _seen_report_ids.add(report_id)
             time.sleep(6)
             downloaded = True
             break
-
         elif status == "ERROR":
-            page.quit()
             fail("Sales report generation failed on the Vinculum side (status ERROR).")
-
         else:
             print("       Still processing... waiting 10s")
-            time.sleep(10)
-            page.refresh()
-            time.sleep(3)
+        time.sleep(10)
+        page.refresh()
+        time.sleep(3)
 
     if not downloaded:
-        page.quit()
         fail(f"Report never reached SUCCESS within {MAX_WAIT_SECONDS}s.")
 
-    # ── STEP 9: UPLOAD TO DRIVE + CLEAN UP ────────────────
-    print("\n[9] Locating downloaded file and uploading to Google Drive...")
-    local_file = get_latest_downloaded_file(LOCAL_DOWNLOAD_PATH, since_ts=pre_download_ts)
-
+    # ── STEP 8: UPLOAD TO DRIVE + CLEAN UP ────────────────
+    print("\n[8] Locating downloaded file and uploading to Google Drive...")
+    local_file = None
+    deadline = time.time() + 60
+    while time.time() < deadline and not local_file:
+        local_file = get_latest_downloaded_file(LOCAL_DOWNLOAD_PATH, since_ts=pre_download_ts)
+        if not local_file:
+            time.sleep(2)
     if not local_file:
-        page.quit()
         fail(f"Could not find the downloaded file in {LOCAL_DOWNLOAD_PATH}.")
 
     print(f"    [✓] Found file: {local_file}")
-    drive_filename = (datetime.today() - timedelta(days=1)).strftime("%d.%m.%Y")
-    uploaded_file_id = upload_to_drive(drive_service, local_file, drive_filename, GDRIVE_FOLDER_ID)
-
-    page.quit()
-
+    drive_name = drive_filename(day, *SALES_REPORT_NAME)
+    uploaded_file_id = upload_to_drive(drive_service, local_file, drive_name, GDRIVE_FOLDER_ID)
     if not uploaded_file_id:
         fail("Drive upload failed. Check that the folder is shared with the service account's client_email.")
 
@@ -431,11 +395,14 @@ def main():
         print(f"    [✓] Local temp file deleted: {local_file}")
     except Exception as e:
         print(f"    [!] Could not delete local temp file: {e}")
+    print(f"  [✓] {drive_name} uploaded to Google Drive as a Sheet.")
 
-    print("\n" + "=" * 55)
-    print("  [✓] SUCCESS! Sales Report uploaded to Google Drive as a Sheet.")
-    print(f"  Drive folder: https://drive.google.com/drive/folders/{GDRIVE_FOLDER_ID}")
-    print("=" * 55)
+
+def main():
+    validate_env()
+    os.makedirs(LOCAL_DOWNLOAD_PATH, exist_ok=True)
+    daily_export.main("MIS Sales Report", SALES_REPORT_NAME, GDRIVE_FOLDER_ID, export_day,
+                      get_drive_service, list_file_names)
 
 
 if __name__ == "__main__":

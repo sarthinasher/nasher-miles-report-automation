@@ -2,13 +2,34 @@ name: Vinculum Sales Report to Drive
 
 on:
   schedule:
+    # Both runs use the catch-up window (2026-10-13): export every invoice day of the
+    # last 7 (ending yesterday, IST) whose DD.MM.YYYY file is missing in Drive. The
+    # second run normally finds nothing to do (no Vinculum login).
     - cron: "40 3 * * *"
-  workflow_dispatch: {}
+    - cron: "40 8 * * *"
+  workflow_dispatch:
+    inputs:
+      report_date:
+        description: >-
+          Invoice date(s) to export, DD/MM/YYYY: one date (11/10/2026), a list or a
+          range (11/10/2026-12/10/2026). Blank = catch-up (missing days of the last 7).
+        required: false
+        default: ""
+      skip_existing:
+        description: "With report_date: skip dates whose file is already in Drive (default: re-export and overwrite)"
+        required: false
+        default: false
+        type: boolean
+
+# One Vinculum user for every report job: two sessions at once kill each other.
+concurrency:
+  group: vinculum-session
+  cancel-in-progress: false
 
 jobs:
   run-vinculum-sales-report:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 60
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -32,11 +53,25 @@ jobs:
           google-chrome --version || true
 
       - name: Install Python dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements.txt pytest==9.1.1
+
+      - name: Run tests
+        run: python -m pytest tests -q
 
       - name: Run Vinculum Sales report script
         env:
           VIN_LOGIN_ID: ${{ secrets.VIN_LOGIN_ID }}
           VIN_PASSWORD: ${{ secrets.VIN_PASSWORD }}
           GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+          REPORT_DATE: ${{ inputs.report_date }}
+          SKIP_EXISTING: ${{ inputs.skip_existing }}
+          PYTHONUNBUFFERED: "1"
         run: python scripts/vinculum_sales_report_to_drive.py
+
+      - name: Upload failure screenshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sales-report-debug
+          path: /tmp/vinculum_sales_debug
+          if-no-files-found: ignore

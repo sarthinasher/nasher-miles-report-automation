@@ -4,32 +4,49 @@ Nasher Miles eRetail - Pick Pack Report -> Google Drive Uploader
 CI / GitHub Actions version. Headless Chrome, all secrets from env vars,
 Drive auth via service account (see common/drive_utils.py).
 
+Login -> Pick Pack Report -> Date = REPORT DATE -> Print -> Pending Reports ->
+wait for a NEW PickPackReport SUCCESS -> download -> upload to Drive as
+PickPackReport_DD.MM.YYYY (the REPORT date). Read by the GT Full Flow FMS
+(Warehouse Team V / pick date X).
+
+Which dates (2026-10-13, common/daily_export.py): REPORT_DATE blank -> every day of
+the last 7 (ending yesterday, IST) whose file is missing in Drive (normally just
+yesterday); REPORT_DATE=27/09/2026 | 11/10/2026,12/10/2026 | 11/10/2026-12/10/2026
+-> exactly those days. Before, only "Yesterday" was exported and a failed run lost
+the day for good (27.09.2026).
+
 Run locally for testing:
-    VIN_LOGIN_ID=Sonali VIN_PASSWORD=... GDRIVE_SERVICE_ACCOUNT_JSON='{...}' \
-        python scripts/pickpack_report_to_drive.py
+    VIN_LOGIN_ID=... VIN_PASSWORD=... GDRIVE_SERVICE_ACCOUNT_JSON='{...}' \
+        REPORT_DATE=27/09/2026 python scripts/pickpack_report_to_drive.py
 """
 
 import sys
 import os
 import time
 import json
-from datetime import datetime, timedelta
-
-from DrissionPage import ChromiumPage, ChromiumOptions
+from datetime import datetime, timedelta, timezone
 
 # Allow running this script directly (python scripts/pickpack_report_to_drive.py)
 # by adding the repo root to the import path.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from common.drive_utils import get_drive_service, upload_to_drive, get_latest_downloaded_file
+from common.drive_utils import (
+    get_drive_service, upload_to_drive, get_latest_downloaded_file, list_file_names,
+)
+from common import daily_export
+from common.report_dates import PICK_PACK_NAME, drive_filename, vinculum_date
+from common.vinculum_ui import (
+    dismiss_top_modals, launch_browser, save_debug_screenshot, set_report_date, vinculum_login,
+)
 
 # ── SETTINGS ──────────────────────────────────────────────
 LOGIN_ID = os.environ.get("VIN_LOGIN_ID")
 PASSWORD = os.environ.get("VIN_PASSWORD")
 ORG_ID   = os.environ.get("VIN_ORG_ID", "")
 
-DATE_OPTION = "Yesterday"
 LOCAL_DOWNLOAD_PATH = "/tmp/pickpack_downloads"
-MAX_WAIT_SECONDS = 150
+DEBUG_DIR = os.environ.get("PICKPACK_DEBUG_DIR", "/tmp/pickpack_debug")
+MAX_WAIT_SECONDS = 240
+IST = timezone(timedelta(hours=5, minutes=30))   # India: no DST
 
 GDRIVE_FOLDER_ID = os.environ.get(
     "PICKPACK_DRIVE_FOLDER_ID", "1Xi66o4A0I3GdtlNrh61XcEWNkT5UKmey"
@@ -38,10 +55,18 @@ GDRIVE_FOLDER_ID = os.environ.get(
 BASE = "https://nashermiles.vineretail.com/eRetailWeb"
 TARGET_REPORT_NAME = "PickPackReport"
 
+# Pending-report rows already downloaded (or already there before this run's
+# request) - never taken as this date's report.
+_seen_rows = set()
 
-def fail(message, code=1):
+
+class ExportError(Exception):
+    quiet = True
+
+
+def fail(message):
     print(f"\n[✗] {message}")
-    sys.exit(code)
+    raise ExportError(message)
 
 
 def validate_env():
@@ -51,174 +76,139 @@ def validate_env():
         ("GDRIVE_SERVICE_ACCOUNT_JSON", os.environ.get("GDRIVE_SERVICE_ACCOUNT_JSON")),
     ] if not val]
     if missing:
-        fail(f"Missing required environment variables/secrets: {', '.join(missing)}")
+        print(f"\n[✗] Missing required environment variables/secrets: {', '.join(missing)}")
+        sys.exit(1)
 
 
-def main():
-    validate_env()
-    os.makedirs(LOCAL_DOWNLOAD_PATH, exist_ok=True)
+ROW1_JS = """
+    try {
+        var row = document.querySelector('tr[role="row"][id="1"]');
+        if(!row) return JSON.stringify({status: 'NO_ROW_1', name: '', text: ''});
+        var cells = row.cells;
+        return JSON.stringify({status: (cells[2].innerText || '').trim(),
+                               name: (cells[5].innerText || '').trim(),
+                               text: (row.innerText || '').replace(/\\s+/g, ' ').trim()});
+    } catch(e) {
+        return JSON.stringify({status: 'ERROR_READING', name: '', text: '', error: e.message});
+    }
+"""
 
-    print("=" * 55)
-    print("  Nasher Miles - Pick Pack Report -> Google Drive")
-    print(f"  Date: {DATE_OPTION}")
-    print("=" * 55)
 
-    print("\n[0] Authenticating Google Drive API (service account)...")
-    drive_service = get_drive_service()
-    print("    [OK] Drive API ready!")
-
-    print("\n[1] Launching headless browser...")
-    co = ChromiumOptions()
-    co.headless(True)
-    co.set_argument("--no-sandbox")
-    co.set_argument("--disable-dev-shm-usage")
-    co.set_argument("--disable-gpu")
-    co.set_argument("--window-size=1920,1080")
-    page = ChromiumPage(addr_or_opts=co)
-    page.set.download_path(LOCAL_DOWNLOAD_PATH)
-    print("    [OK] Browser launched!")
-
-    # ── STEP 2: LOGIN ────────────────────────────────────
-    print("\n[2] Logging in...")
-    page.get(f"{BASE}/eRetailLogin.action?popup=true")
-    time.sleep(4)
-
-    page.run_js("document.querySelector('[name=userOrgId]').removeAttribute('readonly')")
-    page.run_js("document.querySelector('[name=userName]').removeAttribute('readonly')")
-    page.run_js("document.querySelector('[id=password]').removeAttribute('readonly')")
-    time.sleep(1)
-
-    if ORG_ID:
-        page.run_js(f"document.querySelector('[name=userOrgId]').value = '{ORG_ID}'")
-    page.run_js(f"document.querySelector('[name=userName]').value = '{LOGIN_ID}'")
-    page.run_js(f"document.querySelector('[id=password]').value = '{PASSWORD}'")
-    time.sleep(1)
-    page.run_js("document.querySelector('[name=Login][type=submit]').click()")
-    time.sleep(3)
-
+def read_row1(page):
     try:
-        page.handle_alert(accept=True)
-        time.sleep(2)
+        return json.loads(page.run_js(ROW1_JS) or "{}")
     except Exception:
-        pass
-    try:
-        ok = page.ele("xpath://button[contains(text(),'OK')]", timeout=3)
-        if ok:
-            ok.click()
-            time.sleep(2)
-    except Exception:
-        pass
+        return {}
 
-    time.sleep(4)
-    if "login" in page.url.lower():
-        page.quit()
-        fail("Login failed — check VIN_LOGIN_ID / VIN_PASSWORD secrets.")
-    print("[✓] Login successful!")
 
-    # ── STEP 3: OPEN PICK PACK REPORT ────────────────────
-    print("\n[3] Opening Pick Pack Report page...")
-    page.get(f"{BASE}/reportPickPackBS")
-    time.sleep(4)
-    print(f"    URL: {page.url}")
-
-    frame = page
-
-    # ── STEP 4: SET DATE = YESTERDAY ─────────────────────
-    print(f"\n[4] Setting date: {DATE_OPTION}...")
-
+def set_yesterday_range(frame):
+    """The pre-2026-10-13 path ("Yesterday" range + Apply), kept as a fallback."""
     date_input = frame.ele("xpath://label[contains(text(),'Date')]/following::input[1]", timeout=5)
     if not date_input:
         date_input = frame.ele("css:input[type=text]", timeout=5)
-
     if date_input:
         date_input.click()
-        print("    [✓] Date field clicked")
-    else:
-        print("    [!] Date input field not found")
     time.sleep(2)
-
-    clicked = frame.run_js(f"""
+    clicked = frame.run_js("""
         var lis = document.querySelectorAll('.ranges ul li, .ranges li');
-        for(var li of lis) {{
-            if(li.innerText.trim() === '{DATE_OPTION}') {{
-                li.click();
-                return '[✓] Clicked: {DATE_OPTION}';
-            }}
-        }}
+        for(var li of lis) { if(li.innerText.trim() === 'Yesterday') { li.click(); return 'Clicked: Yesterday'; } }
         var items = document.querySelectorAll('[data-range-key]');
-        for(var item of items) {{
-            if(item.getAttribute('data-range-key') === '{DATE_OPTION}') {{
-                item.click();
-                return '[✓] Clicked by key: {DATE_OPTION}';
-            }}
-        }}
-        var avail = [];
-        document.querySelectorAll('.ranges ul li,.ranges li').forEach(function(li){{avail.push(li.innerText.trim());}});
-        return '[!] Not found. Available: ' + avail.join(', ');
+        for(var item of items) { if(item.getAttribute('data-range-key') === 'Yesterday') { item.click(); return 'Clicked by key: Yesterday'; } }
+        return 'NOT_FOUND';
     """)
-    print(f"    {clicked}")
+    time.sleep(1)
+    frame.run_js("""
+        var btn = document.querySelector('.applyBtn');
+        if(btn) { btn.click(); return; }
+        var ab = [...document.querySelectorAll('button')].find(b => (b.innerText||'').trim() === 'Apply');
+        if(ab) ab.click();
+    """)
+    time.sleep(2)
+    return clicked
+
+
+def export_day(drive_service, day, attempt):
+    """One attempt for one report date: fresh browser -> export -> upload."""
+    print("\n[1] Launching headless browser...")
+    page = launch_browser(LOCAL_DOWNLOAD_PATH)
+    print("    [OK] Browser launched!")
+    try:
+        _export_steps(page, drive_service, day)
+    except Exception:
+        save_debug_screenshot(page, DEBUG_DIR, f"fail_{day:%Y-%m-%d}_attempt{attempt}.png")
+        raise
+    finally:
+        try:
+            page.quit()
+        except Exception:
+            pass
+
+
+def _export_steps(page, drive_service, day):
+    day_str = vinculum_date(day)
+    yesterday = datetime.now(IST).date() - timedelta(days=1)
+
+    # ── STEP 2: LOGIN (LoginError stops the whole run) ───
+    print("\n[2] Logging in...")
+    vinculum_login(page, BASE, LOGIN_ID, PASSWORD, ORG_ID)
+    dismiss_top_modals(page, "after login")
+
+    # ── STEP 3: NOTE THE NEWEST PENDING REPORT BEFORE OUR REQUEST ─
+    page.get(f"{BASE}/pendingDisplay")
+    time.sleep(4)
+    before = read_row1(page)
+    if before.get("text"):
+        _seen_rows.add(before["text"])
+    print(f"    Newest pending report before this request: {before.get('text', '')[:120]!r}")
+
+    # ── STEP 4: OPEN PICK PACK REPORT ────────────────────
+    print("\n[4] Opening Pick Pack Report page...")
+    page.get(f"{BASE}/reportPickPackBS")
+    time.sleep(4)
+    print(f"    URL: {page.url}")
+    dismiss_top_modals(page, "on Pick Pack")
+
+    # ── STEP 5: SET DATE = REPORT DATE ───────────────────
+    print(f"\n[5] Setting date: {day_str}...")
+    ok, detail = set_report_date(page, day_str)
+    print(f"    daterangepicker -> {detail}")
+    if not ok:
+        if day == yesterday:
+            print(f"    [!] Could not set {day_str} directly — using the 'Yesterday' range.")
+            print(f"    {set_yesterday_range(page)}")
+        else:
+            fail(f"Could not set the Pick Pack date to {day_str} ({detail}).")
     time.sleep(1)
 
-    apply_result = frame.run_js("""
-        var btn = document.querySelector('.applyBtn');
-        if(btn) { btn.click(); return '[✓] Apply clicked'; }
-        var btns = [...document.querySelectorAll('button')];
-        var ab = btns.find(b => (b.innerText||'').trim() === 'Apply');
-        if(ab) { ab.click(); return '[✓] Apply clicked by text'; }
-        return '[!] Apply button not found';
-    """)
-    print(f"    {apply_result}")
-    time.sleep(2)
-
-    date_val = frame.run_js("""
-        var input = document.querySelector('input[type=text]');
-        return input ? input.value : 'not found';
-    """)
-    print(f"    Date set to: {date_val}")
-
-    # ── STEP 5: CLICK PRINT ───────────────────────────────
-    print("\n[5] Clicking Print...")
-    print_result = frame.run_js("""
+    # ── STEP 6: CLICK PRINT ───────────────────────────────
+    print("\n[6] Clicking Print...")
+    print_result = page.run_js("""
         var btns = [...document.querySelectorAll('button,a')];
         var b = btns.find(x => (x.innerText||'').trim() === 'Print');
         if(b) { b.click(); return '[✓] Print clicked'; }
         return '[!] Print button not found';
     """)
     print(f"    {print_result}")
+    if "not found" in str(print_result):
+        fail("Print button not found on the Pick Pack page.")
     time.sleep(3)
 
-    # ── STEP 6: PENDING REPORTS QUEUE ─────────────────────
-    print(f"\n[6] Navigating to Pending Reports queue (max wait {MAX_WAIT_SECONDS}s)...")
+    # ── STEP 7: PENDING REPORTS QUEUE ─────────────────────
+    print(f"\n[7] Waiting in Pending Reports for a NEW {TARGET_REPORT_NAME} "
+          f"(max {MAX_WAIT_SECONDS}s)...")
     page.get(f"{BASE}/pendingDisplay")
     time.sleep(4)
-    print(f"    URL: {page.url}")
 
     start_time = time.time()
     downloaded = False
     pre_download_ts = None
-
     while time.time() - start_time < MAX_WAIT_SECONDS:
-        status_info = page.run_js("""
-            try {
-                var row = document.querySelector('tr[role="row"][id="1"]');
-                if(!row) return JSON.stringify({status: 'NO_ROW_1'});
-                var cells = row.cells;
-                var status = (cells[2].innerText || '').trim();
-                var name   = (cells[5].innerText || '').trim();
-                return JSON.stringify({status: status, name: name});
-            } catch(e) {
-                return JSON.stringify({status: 'ERROR_READING', error: e.message});
-            }
-        """)
-        try:
-            info = json.loads(status_info)
-        except Exception:
-            info = {}
-        status = info.get('status', '')
-        name = info.get('name', '')
+        info = read_row1(page)
+        status, name, text = info.get("status", ""), info.get("name", ""), info.get("text", "")
         elapsed = int(time.time() - start_time)
-
-        if status == "SUCCESS" and name == TARGET_REPORT_NAME:
+        if text and text in _seen_rows:
+            print(f"    [{elapsed:3d}s] Row 1 is still an earlier report — waiting for this one...")
+        elif status == "SUCCESS" and name == TARGET_REPORT_NAME:
             print(f"    [{elapsed:3d}s] Row 1 = {name}, Status: SUCCESS — downloading...")
             pre_download_ts = time.time()
             dl_result = page.run_js("""
@@ -232,36 +222,35 @@ def main():
                 return 'Row 1 found but no download label located';
             """)
             print(f"    {dl_result}")
+            _seen_rows.add(text)
             time.sleep(6)
             downloaded = True
             break
         elif status == "ERROR" and name == TARGET_REPORT_NAME:
-            page.quit()
             fail("Pick Pack report generation failed on the Vinculum side (status ERROR).")
         else:
             print(f"    [{elapsed:3d}s] Row 1 is '{name}' (status: {status}) — refreshing in 10s...")
-            time.sleep(10)
-            page.refresh()
-            time.sleep(3)
+        time.sleep(10)
+        page.refresh()
+        time.sleep(3)
 
     if not downloaded:
-        page.quit()
         fail(f"Report never reached SUCCESS within {MAX_WAIT_SECONDS}s.")
 
-    # ── STEP 7: UPLOAD TO DRIVE + CLEAN UP ───────────────
-    print("\n[7] Locating downloaded file and uploading to Google Drive...")
-    local_file = get_latest_downloaded_file(LOCAL_DOWNLOAD_PATH, since_ts=pre_download_ts)
-
+    # ── STEP 8: UPLOAD TO DRIVE + CLEAN UP ───────────────
+    print("\n[8] Locating downloaded file and uploading to Google Drive...")
+    local_file = None
+    deadline = time.time() + 60
+    while time.time() < deadline and not local_file:
+        local_file = get_latest_downloaded_file(LOCAL_DOWNLOAD_PATH, since_ts=pre_download_ts)
+        if not local_file:
+            time.sleep(2)
     if not local_file:
-        page.quit()
         fail(f"Could not find the downloaded file in {LOCAL_DOWNLOAD_PATH}.")
 
     print(f"    [✓] Found file: {local_file}")
-    drive_filename = "PickPackReport_" + (datetime.today() - timedelta(days=1)).strftime("%d.%m.%Y")
-    uploaded_file_id = upload_to_drive(drive_service, local_file, drive_filename, GDRIVE_FOLDER_ID)
-
-    page.quit()
-
+    drive_name = drive_filename(day, *PICK_PACK_NAME)
+    uploaded_file_id = upload_to_drive(drive_service, local_file, drive_name, GDRIVE_FOLDER_ID)
     if not uploaded_file_id:
         fail("Drive upload failed. Check that the folder is shared with the service account's client_email.")
 
@@ -271,11 +260,14 @@ def main():
         print(f"    [✓] Local temp file deleted: {local_file}")
     except Exception as e:
         print(f"    [!] Could not delete local temp file: {e}")
+    print(f"  [✓] {drive_name} uploaded to Google Drive as a Sheet.")
 
-    print("\n" + "=" * 55)
-    print("  [✓] SUCCESS! Pick Pack Report uploaded to Google Drive as a Sheet.")
-    print(f"  Drive folder: https://drive.google.com/drive/folders/{GDRIVE_FOLDER_ID}")
-    print("=" * 55)
+
+def main():
+    validate_env()
+    os.makedirs(LOCAL_DOWNLOAD_PATH, exist_ok=True)
+    daily_export.main("Pick Pack Report", PICK_PACK_NAME, GDRIVE_FOLDER_ID, export_day,
+                      get_drive_service, list_file_names)
 
 
 if __name__ == "__main__":

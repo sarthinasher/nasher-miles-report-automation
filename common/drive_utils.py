@@ -118,10 +118,13 @@ def list_file_names(drive_service, folder_id, name_contains):
     name_contains. Returns None if Drive can't be listed (callers then must
     not skip any work)."""
     names, token = set(), None
+    query = f"'{folder_id}' in parents and trashed=false"
+    if name_contains:
+        query += f" and name contains '{name_contains}'"
     try:
         while True:
             resp = drive_service.files().list(
-                q=f"'{folder_id}' in parents and trashed=false and name contains '{name_contains}'",
+                q=query,
                 fields="nextPageToken, files(name)", pageSize=1000, pageToken=token,
                 supportsAllDrives=True, includeItemsFromAllDrives=True,
             ).execute()
@@ -132,6 +135,22 @@ def list_file_names(drive_service, folder_id, name_contains):
     except Exception as e:
         print(f"    [!] Could not list Drive folder ({e!r}) — not skipping anything.")
         return None
+
+
+def find_drive_file_by_name(drive_service, folder_id, name):
+    """Metadata {id, name, mimeType, modifiedTime} of the newest non-trashed file in
+    folder_id named exactly `name`, or None."""
+    safe = name.replace("\\", "\\\\").replace("'", "\\'")
+    results = drive_service.files().list(
+        q=f"'{folder_id}' in parents and trashed=false and name='{safe}'",
+        fields="files(id,name,mimeType,modifiedTime)",
+        orderBy="modifiedTime desc",
+        pageSize=10,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute()
+    files = results.get("files", [])
+    return files[0] if files else None
 
 
 def get_newest_drive_file(drive_service, folder_id):
