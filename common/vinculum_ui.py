@@ -26,6 +26,7 @@ be unit-tested without a browser.
 
 import json
 import os
+import re
 import time
 
 
@@ -82,7 +83,8 @@ LOGIN_MESSAGE_JS = """
     return (function(){
         var sel = ['.error', '.errorMessage', '.errormsg', '.alert', '.alert-danger',
                    '.text-danger', '#errorMsg', '#msg', '.loginError', '.help-block',
-                   'font[color=red]', 'span[style*="red"]', 'div[style*="red"]'];
+                   'font[color=red]', 'span[style*="red"]', 'div[style*="red"]',
+                   '#notification', '.actionError', '.errorMessage li'];
         var out = [];
         sel.forEach(function(s){
             document.querySelectorAll(s).forEach(function(e){
@@ -169,7 +171,9 @@ def vinculum_login(page, base, login_id, password, org_id=""):
             page_text = page.run_js(LOGIN_MESSAGE_JS) or ""
         except Exception:
             page_text = ""
-        raise LoginError(login_failure_message(" | ".join(alerts), page_text, login_id))
+        url = re.sub(r";jsessionid=[^?#]*", "", page.url or "")
+        raise LoginError(login_failure_message(" | ".join(alerts), page_text, login_id)
+                         + f" [page after submit: {url}]")
     if alerts:
         print(f"    Vinculum said at login (accepted): {' | '.join(alerts)}")
     print("[✓] Login successful!")

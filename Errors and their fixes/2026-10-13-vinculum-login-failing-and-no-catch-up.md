@@ -57,9 +57,17 @@
   With five workflows in `vinculum-session`, GitHub keeps only ONE waiting run per group and cancels
   an older waiting one — Pick Pack / Sales / Order Enquiry recover through catch-up, Inventory (a
   snapshot) could miss a day.
+- **Live check after the fix (run 38364136982, Pick Pack catch-up, 13-Oct):** one login attempt,
+  then stop: `Vinculum login failed for user '***': no message shown, still on the login page`;
+  12.10 marked `NOT RUN`. The current login page (fetched 13-Oct) RSA-encrypts the password in
+  `doLoginJS()` (`#password` -> `encryptPasswordRSAUsingPubKey` -> hidden `name="password"`); the
+  script's submit click runs that same `doLoginJS()`, so the page flow is unchanged for it. Vinculum
+  shows no reason on a failed login, which points to the stored credentials (user `Diwakar`, whose
+  work is being handed over) no longer being accepted.
 - **Still open:**
   - The login itself: needs a valid Vinculum user/password in the repo secrets `VIN_LOGIN_ID` /
     `VIN_PASSWORD` (ideally a service user, not a person's account). Nothing in code can fix this.
+    Check first by logging in by hand at nashermiles.vineretail.com with the stored user.
   - `Sales/Vinculum/11.10.2026.xlsx` on SharePoint holds 10-Oct invoices: re-run "Sync Sales to
     SharePoint" with `report_date` `11/10/2026` once `11.10.2026` exists in Drive (it replaces it).
   - The custom-date path (`set_report_date`) is proven on the Order Enquiry page only; the first
