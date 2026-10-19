@@ -512,3 +512,259 @@ def request_dialog_export(dctx, outer_dctx):
     if not clicked:
         return False, "Could not click dialog Export."
     return True, "requested"
+
+
+# ── Locations / warehouses (2026-10-19) ──────────────────────
+# Every Vinculum export only covers the session's CURRENT location: the report
+# screens' "Site Location" select (Pick Pack #siteLocationCode, Sales #siteLoc) lists
+# that one location only. The old "Diwakar" user's exports held every warehouse; the
+# user that replaced it on 2026-10-19 lands on NM4 and the files shrank ~10x (see
+# "Errors and their fixes/2026-10-19-new-vinculum-login-exports-only-nm4.md").
+# The header's "Switch Location" dialog (selCompanyLocationBS?operation=switch:
+# Company / Location / ... / Set As Default | Remove Default | Do Nothing) lists every
+# location the user is mapped to and has no "All" entry, so the report scripts export
+# once per location and merge the files (common/report_merge.py). The switch always
+# posts setDefault=remainSame ("Do Nothing"): the user's default is never changed.
+# VIN_LOCATIONS (env) picks the locations: blank / "all" = every location offered;
+# "A03,NM4" = exactly those; "all,-S01,-S02" = all but those.
+SWITCH_LOCATION_PAGE = "selCompanyLocationBS?operation=switch"
+
+READ_LOCATIONS_JS = """
+    return (function(){
+        var sel = document.getElementById('locationDetail');
+        if (!sel) return JSON.stringify({bad: 'NO_LOCATION_SELECT'});
+        var cur = document.getElementById('location');
+        var comp = document.getElementById('companyDetail');
+        var opts = [];
+        for (var i = 0; i < sel.options.length; i++) {
+            var o = sel.options[i];
+            if (o.value && o.value !== '-1') opts.push([o.value, (o.text || '').trim()]);
+        }
+        return JSON.stringify({bad: null, current: cur ? cur.value : '',
+                               selected: sel.value, company: comp ? comp.value : '',
+                               options: opts});
+    })();
+"""
+
+
+def switch_location_js(loc):
+    """Selects loc on the Switch Location page, keeps "Do Nothing" for the default
+    location and calls the page's own doCompanyChange() a moment later (so run_js
+    returns before the page reloads)."""
+    lj = json.dumps(loc)
+    return f"""
+        return (function(){{
+            var sel = document.getElementById('locationDetail');
+            if (!sel) return 'NO_LOCATION_SELECT';
+            var has = false;
+            for (var i = 0; i < sel.options.length; i++) if (sel.options[i].value === {lj}) has = true;
+            if (!has) return 'NO_OPTION';
+            if (window.jQuery) jQuery(sel).val({lj}).trigger('change');
+            else {{ sel.value = {lj}; if (sel.onchange) sel.onchange(); }}
+            var radios = document.querySelectorAll('input[name=setDefault]');
+            for (var j = 0; j < radios.length; j++) radios[j].checked = (radios[j].value === 'remainSame');
+            if (radios.length && !document.querySelector('input[name=setDefault][value=remainSame]:checked'))
+                return 'NO_DO_NOTHING_OPTION';
+            if (typeof doCompanyChange !== 'function') return 'NO_SUBMIT_FUNCTION';
+            if (sel.value !== {lj}) return 'NOT_SELECTED|' + sel.value;
+            setTimeout(function(){{ doCompanyChange(); }}, 100);
+            return 'SUBMITTING';
+        }})();
+    """
+
+
+class LocationError(Exception):
+    """A location could not be listed / switched to. Retryable (fresh browser)."""
+    quiet = True
+
+
+def parse_locations(raw):
+    """JSON from READ_LOCATIONS_JS -> dict (never raises)."""
+    try:
+        d = json.loads(raw)
+        if isinstance(d, dict):
+            d.setdefault("options", [])
+            return d
+    except Exception:
+        pass
+    return {"bad": "PARSE", "options": [], "current": ""}
+
+
+def resolve_locations(available, spec):
+    """Which location codes to export, in the order Vinculum lists them (or the
+    order given). available = [code, ...]; spec = the VIN_LOCATIONS value:
+      "" / "all" / "*"   -> every available location
+      "A03, nm4"         -> exactly those (case-insensitive)
+      "all,-S01,-S02"    -> all but S01 / S02
+    Raises LocationError for a code the user cannot switch to (never silently
+    skipped) or when nothing is left."""
+    avail = [a.strip().upper() for a in available if a and a.strip()]
+    tokens = [t.strip().upper() for t in (spec or "").replace(";", ",").split(",") if t.strip()]
+    include = [t for t in tokens if not t.startswith("-")]
+    exclude = {t[1:].strip() for t in tokens if t.startswith("-")}
+    if not include or any(t in ("ALL", "*") for t in include):
+        chosen = list(avail)
+    else:
+        unknown = [t for t in include if t not in avail]
+        if unknown:
+            raise LocationError(f"VIN_LOCATIONS asks for {', '.join(unknown)}, but this Vinculum "
+                                f"user can only switch to: {', '.join(avail) or '(none)'}")
+        chosen = []
+        for t in include:
+            if t not in chosen:
+                chosen.append(t)
+    unknown_ex = sorted(t for t in exclude if t not in avail)
+    if unknown_ex:
+        print(f"    [!] VIN_LOCATIONS excludes {', '.join(unknown_ex)}, which this user "
+              f"cannot switch to anyway.")
+    chosen = [c for c in chosen if c not in exclude]
+    if not chosen:
+        raise LocationError(f"VIN_LOCATIONS={spec!r} leaves no location to export "
+                            f"(available: {', '.join(avail) or '(none)'})")
+    return chosen
+
+
+def read_locations(page, base):
+    """Opens the Switch Location page; returns {current, options: [[code, name]], ...}."""
+    page.get(f"{base}/{SWITCH_LOCATION_PAGE}")
+    time.sleep(4)
+    try:
+        info = parse_locations(page.run_js(READ_LOCATIONS_JS))
+    except Exception as e:
+        info = {"bad": f"JS_ERROR {e!r}", "options": [], "current": ""}
+    if info.get("bad"):
+        raise LocationError(f"Could not read the Switch Location page ({info['bad']}).")
+    return info
+
+
+def plan_locations(page, base, spec=None):
+    """Logs every location the user can switch to; returns (codes_to_export,
+    session_location). Call right after vinculum_login."""
+    spec = os.environ.get("VIN_LOCATIONS", "") if spec is None else spec
+    info = read_locations(page, base)
+    names = {c.strip().upper(): n for c, n in info["options"]}
+    current = (info.get("current") or info.get("selected") or "").strip().upper()
+    print(f"    Vinculum locations this user can switch to ({len(names)}): "
+          + ", ".join(f"{c} ({n})" for c, n in names.items()))
+    print(f"    Session location after login: {current or '?'}")
+    chosen = resolve_locations(list(names), spec)
+    print(f"    VIN_LOCATIONS={spec!r} -> exporting {len(chosen)} location(s): {', '.join(chosen)}")
+    return chosen, current
+
+
+def switch_location(page, base, loc, tries=2):
+    """Makes loc the session location (setDefault = "Do Nothing") and verifies it
+    on the Switch Location page. Raises LocationError if it did not take."""
+    loc = loc.strip().upper()
+    last = ""
+    for attempt in range(1, tries + 1):
+        page.get(f"{base}/{SWITCH_LOCATION_PAGE}")
+        time.sleep(4)
+        try:
+            res = page.run_js(switch_location_js(loc))
+        except Exception as e:
+            res = f"ERR {e!r}"
+        if res != "SUBMITTING":
+            last = f"switch page said {res}"
+            print(f"    [!] Switch to {loc} (try {attempt}): {last}")
+            continue
+        time.sleep(3)
+        said = read_alert(page, timeout=2)
+        if said:
+            print(f"    [!] Vinculum said while switching to {loc}: {said}")
+        time.sleep(4)
+        try:
+            cur = (read_locations(page, base).get("current") or "").strip().upper()
+        except LocationError as e:
+            cur = ""
+            print(f"    [!] {e}")
+        if cur == loc:
+            print(f"    [✓] Vinculum location is now {loc}")
+            return
+        last = f"session location is still {cur or '?'}"
+        print(f"    [!] Switch to {loc} (try {attempt}) did not take: {last}")
+    raise LocationError(f"Could not switch the Vinculum location to {loc} ({last}).")
+
+
+SITE_LOCATION_JS = """
+    return (function(){
+        var s = document.querySelector('#siteLocationCode, #siteLoc, select[name=loc], select[name="reportDTO.siteLoc"]');
+        if (!s) return '';
+        var opts = [];
+        for (var i = 0; i < s.options.length; i++) opts.push(s.options[i].value);
+        return s.value + '|' + opts.join(',');
+    })();
+"""
+
+
+def check_site_location(ctx, loc):
+    """On a report screen with a "Site Location" select: True if it is set to loc,
+    False if it shows another location, None if the screen has no such select."""
+    try:
+        raw = ctx.run_js(SITE_LOCATION_JS) or ""
+    except Exception:
+        raw = ""
+    if not raw:
+        return None
+    value, _, opts = raw.partition("|")
+    print(f"    Site Location on screen: {value} (options: {opts})")
+    return value.strip().upper() == loc.strip().upper()
+
+
+# Strict on purpose: a message wrongly taken as "no data" would silently drop that
+# location from the merged file; anything else just waits for the report (and fails
+# loudly if none comes).
+NO_DATA_RX = re.compile(r"\bno\s+(data|records?|results?)\b", re.I)
+
+
+def is_no_data_message(text):
+    """True for Vinculum's 'No Record Found' / 'No data found' style messages."""
+    return bool(text and NO_DATA_RX.search(str(text)))
+
+
+def read_alert(page, timeout=2):
+    """Accepts a JS alert if one is open and returns its text, else ''."""
+    try:
+        try:
+            text = page.handle_alert(accept=True, timeout=timeout)
+        except TypeError:                         # older DrissionPage: no timeout kw
+            text = page.handle_alert(accept=True)
+    except Exception:
+        text = None
+    return str(text) if text else ""
+
+
+def read_page_message(page, timeout=2):
+    """Alert text (accepted) or the visible on-page message after a click, or ''."""
+    text = read_alert(page, timeout)
+    if text:
+        return text
+    try:
+        return page.run_js(LOGIN_MESSAGE_JS) or ""
+    except Exception:
+        return ""
+
+
+def export_all_locations(page, base, export_one, spec=None):
+    """Runs export_one(loc) -> local file (or None = no data at loc) for every
+    location VIN_LOCATIONS selects, switching the session location in between.
+    Starts with the session's own location (one switch less) and switches back
+    to it at the end. Returns [(loc, file_or_None)] in export order. Any failure
+    (switch or export) raises: a partial merge is never uploaded."""
+    locs, original = plan_locations(page, base, spec)
+    order = ([original] if original in locs else []) + [x for x in locs if x != original]
+    parts, current = [], original
+    try:
+        for i, loc in enumerate(order, 1):
+            print(f"\n  ── Location {loc} ({i}/{len(order)}) ──")
+            if loc != current:
+                switch_location(page, base, loc)
+                current = loc
+            parts.append((loc, export_one(loc)))
+    finally:
+        if original and current != original:
+            try:
+                switch_location(page, base, original)
+            except Exception as e:
+                print(f"    [!] Could not switch back to {original}: {e}")
+    return parts

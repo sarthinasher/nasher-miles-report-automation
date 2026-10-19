@@ -10,6 +10,12 @@ Pending Report -> wait for a NEW OrderEnquiryExport SUCCESS ->
 downloadReport() -> upload to Google Drive as OrderEnquiry_DD-MM-YYYY
 (the REPORT date, not the run date).
 
+Which locations (2026-10-19): Vinculum exports only the session's location, so the
+report is exported once per location the login can switch to (VIN_LOCATIONS: blank /
+all = every one; "A03,NM4"; "all,-S01") and the files are merged into the one Drive
+file (common/vinculum_ui.export_all_locations, common/report_merge.py). VIN_DRY_RUN=true
+= export + merge without uploading.
+
 Which dates (see common/report_dates.py):
   REPORT_DATE unset/blank -> catch-up: the last 7 days ending yesterday (IST)
                              whose file is NOT yet in Drive (normally just yesterday;
@@ -42,9 +48,10 @@ from common.report_dates import (
     should_retry, vinculum_date,
 )
 from common.report_dates import drive_filename as drive_filename_for
+from common.report_merge import dry_run, keep_dry_run_copy, merge_for_upload, remove_files
 from common.vinculum_ui import (
-    LoginError, dismiss_top_modals, request_dialog_export, select_all_export_fields,
-    vinculum_login,
+    LoginError, dismiss_top_modals, export_all_locations, request_dialog_export,
+    select_all_export_fields, vinculum_login,
 )
 from common.vinculum_ui import launch_browser as _launch_browser
 from common.vinculum_ui import save_debug_screenshot as _save_debug_screenshot
@@ -131,6 +138,69 @@ def _run_steps(page, drive_service, report_day):
     # LoginError (with Vinculum's reason) stops the whole run: see main().
     vinculum_login(page, BASE, LOGIN_ID, PASSWORD, ORG_ID)
     dismiss_top_modals(page, "after login")
+    home_url = page.url
+
+    # ── STEPS 3-9 PER LOCATION, THEN MERGE (2026-10-19) ──
+    # Vinculum exports only the session's location: export every location the user
+    # can switch to (VIN_LOCATIONS) and merge them into the one OrderEnquiry_ file.
+    print("\n[2b] Locations...")
+    drive_filename = drive_filename_for(report_day)
+    parts, local_file = [], None
+    try:
+        parts = export_all_locations(
+            page, BASE, lambda loc: _export_location(page, report_day, loc, home_url))
+        local_file, _total = merge_for_upload(parts, LOCAL_DOWNLOAD_PATH, drive_filename)
+        if not local_file:
+            fail(f"No location returned an Order Enquiry file for {vinculum_date(report_day)}.")
+        if dry_run():
+            keep_dry_run_copy(local_file, DEBUG_DIR, drive_filename)
+            return
+
+        # ── STEP 10: UPLOAD TO DRIVE ─────────────────────
+        print("\n[10] Uploading to Google Drive...")
+        uploaded_file_id = upload_to_drive(drive_service, local_file, drive_filename, GDRIVE_FOLDER_ID)
+        if not uploaded_file_id:
+            fail("Drive upload failed. Check that the folder is shared with the service account's client_email.")
+        print(f"    Link: https://drive.google.com/file/d/{uploaded_file_id}/view")
+    finally:
+        remove_files([p for _, p in parts] + [local_file])
+
+    print("\n" + "=" * 55)
+    print("  [✓] SUCCESS! Order Enquiry report uploaded to Google Drive as a Sheet.")
+    print(f"  Drive folder: https://drive.google.com/drive/folders/{GDRIVE_FOLDER_ID}")
+    print("=" * 55)
+
+
+# Order Enquiry result grid: jqGrid's total record count, or null if unreadable.
+GRID_RECORDS_JS = """
+    try {
+        if (!window.jQuery || !jQuery.fn.jqGrid) return null;
+        var g = jQuery('table.ui-jqgrid-btable').filter(function(){ return this.offsetWidth > 0; }).first();
+        if (!g.length) return null;
+        var n = g.jqGrid('getGridParam', 'records');
+        return (typeof n === 'number') ? n : (n === undefined || n === null || n === '' ? null : parseInt(n, 10));
+    } catch (e) { return null; }
+"""
+
+ORG_LOC_JS = "var e = document.getElementById('orgLocKey'); return e ? e.value : '';"
+
+
+def _export_location(page, report_day, loc, home_url):
+    """Steps 3-9 for the session's current location (loc): returns the downloaded
+    file, or None when the location has no orders that day."""
+    # Each location starts from the landing page (the Sales > Order Enquiry menu
+    # lives there); its hidden orgLocKey ("NM4_NASA") proves the switch took.
+    if (page.url or "") != home_url:
+        page.get(home_url)
+        time.sleep(5)
+        dismiss_top_modals(page, "on the landing page")
+    try:
+        org_loc = (page.run_js(ORG_LOC_JS) or "").strip().upper()
+    except Exception:
+        org_loc = ""
+    print(f"    Landing page location key: {org_loc or '?'}")
+    if org_loc and not org_loc.startswith(loc.upper() + "_"):
+        fail(f"Landing page is on {org_loc}, not {loc} - the location switch did not take.")
 
     # ── SHARED: locate the frame hosting a marker text ───
     def find_context(marker_text, max_wait=15):
@@ -277,6 +347,20 @@ def _run_steps(page, drive_service, report_day):
     except Exception:
         pass
     time.sleep(2)
+    try:
+        n_orders = ctx.run_js(GRID_RECORDS_JS)
+    except Exception:
+        n_orders = None
+    print(f"    {loc}: Order Enquiry grid shows {n_orders} order(s) for {y_str}")
+    if n_orders == 0:                     # re-check once: the grid may still be filling
+        time.sleep(5)
+        try:
+            n_orders = ctx.run_js(GRID_RECORDS_JS)
+        except Exception:
+            n_orders = None
+        if n_orders == 0:
+            print(f"    [✓] {loc}: no orders for {y_str} - nothing to export here.")
+            return None
 
     # ── STEP 6: OPEN EXPORT DIALOG ────────────────────────
     # The Pending Report grid only shows request times to the minute, and step 9
@@ -584,6 +668,7 @@ def _run_steps(page, drive_service, report_day):
                 downloaded_file = wait_for_new_file(LOCAL_DOWNLOAD_PATH, pre_download_ts, timeout=90)
                 if downloaded_file:
                     downloaded = True
+                    _last_export_request_ts = 0.0   # consumed: no gap needed before the next
                     print(f"    [✓] File downloaded: {downloaded_file}")
                 else:
                     print("    [!] downloadReport fired but no file appeared in time.")
@@ -597,31 +682,11 @@ def _run_steps(page, drive_service, report_day):
     if not downloaded:
         fail(f"Report did not download within {MAX_WAIT_SECONDS}s.")
 
-    # ── STEP 10: UPLOAD TO DRIVE + CLEAN UP ───────────────
-    print("\n[10] Uploading to Google Drive...")
     local_file = downloaded_file or get_latest_downloaded_file(LOCAL_DOWNLOAD_PATH, since_ts=pre_download_ts)
-
     if not local_file:
         fail(f"Could not find the downloaded file in {LOCAL_DOWNLOAD_PATH}.")
-
     print(f"    [✓] Found file: {local_file}")
-    drive_filename = drive_filename_for(report_day)
-    uploaded_file_id = upload_to_drive(drive_service, local_file, drive_filename, GDRIVE_FOLDER_ID)
-
-    if not uploaded_file_id:
-        fail("Drive upload failed. Check that the folder is shared with the service account's client_email.")
-
-    print(f"    Link: https://drive.google.com/file/d/{uploaded_file_id}/view")
-    try:
-        os.remove(local_file)
-        print(f"    [✓] Local temp file deleted: {local_file}")
-    except Exception as e:
-        print(f"    [!] Could not delete local temp file: {e}")
-
-    print("\n" + "=" * 55)
-    print("  [✓] SUCCESS! Order Enquiry report uploaded to Google Drive as a Sheet.")
-    print(f"  Drive folder: https://drive.google.com/drive/folders/{GDRIVE_FOLDER_ID}")
-    print("=" * 55)
+    return local_file
 
 
 def existing_drive_names(drive_service, folder_id, prefix="OrderEnquiry_"):

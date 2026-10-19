@@ -2,6 +2,8 @@ import os
 import sys
 from datetime import date
 
+import pytest
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from common.report_dates import drive_filename, week_start, weekly_file_present  # noqa: E402
 from common.vinculum_ui import all_fields_selected, parse_field_state  # noqa: E402
@@ -76,3 +78,56 @@ def test_manual_mid_week_file_counts_for_the_week():
 def test_future_dated_file_in_week_is_ignored():
     # only Monday..today counts
     assert not weekly_file_present(date(2026, 10, 6), {"SKU Master 08-10-2026"}, SKU)
+
+
+# ── locations (2026-10-19): which locations to export ──
+from common.vinculum_ui import (  # noqa: E402
+    LocationError, is_no_data_message, parse_locations, resolve_locations,
+)
+
+AVAIL = ["A02", "A03", "GJ1", "NM4", "S01", "S02"]
+
+
+def test_blank_or_all_means_every_location_the_user_can_switch_to():
+    assert resolve_locations(AVAIL, "") == AVAIL
+    assert resolve_locations(AVAIL, "all") == AVAIL
+    assert resolve_locations(AVAIL, " * ") == AVAIL
+
+
+def test_explicit_list_keeps_its_order_and_ignores_case_and_repeats():
+    assert resolve_locations(AVAIL, "nm4, A03,nm4") == ["NM4", "A03"]
+
+
+def test_exclusions():
+    assert resolve_locations(AVAIL, "all,-S01,-s02") == ["A02", "A03", "GJ1", "NM4"]
+    assert resolve_locations(AVAIL, "-S01") == ["A02", "A03", "GJ1", "NM4", "S02"]
+
+
+def test_a_location_the_user_cannot_switch_to_is_an_error_not_skipped():
+    with pytest.raises(LocationError) as e:
+        resolve_locations(AVAIL, "A03,AL4")
+    assert "AL4" in str(e.value)
+
+
+def test_nothing_left_is_an_error():
+    with pytest.raises(LocationError):
+        resolve_locations(AVAIL, "A03,-A03")
+    with pytest.raises(LocationError):
+        resolve_locations([], "")
+
+
+def test_parse_locations():
+    d = parse_locations('{"bad": null, "current": "NM4", "options": [["A03", "A03-Kolkata"]]}')
+    assert d["current"] == "NM4" and d["options"] == [["A03", "A03-Kolkata"]]
+    assert parse_locations("not json")["bad"] == "PARSE"
+    assert parse_locations(None)["bad"] == "PARSE"
+
+
+def test_no_data_messages():
+    for text in ("No Record Found", "No data found in the grid", "No records to export",
+                 "no result"):
+        assert is_no_data_message(text), text
+    # anything else must NOT count as "no data" (that location would be skipped)
+    for text in ("", None, "Report request submitted successfully", "Session expired",
+                 "Report not found", "Print button not found", "0 records", "Notification"):
+        assert not is_no_data_message(text), text

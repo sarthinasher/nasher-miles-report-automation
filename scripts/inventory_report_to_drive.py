@@ -8,6 +8,13 @@ Logs in -> WMS -> Inventory View -> By SKU BIN -> Search -> Export ->
 Waits for SUCCESS -> Downloads -> Uploads to Drive as a native Google Sheet
 -> deletes the local temp copy.
 
+Which locations (2026-10-19): Vinculum exports only the session's location, so the
+inventory is exported once per location the login can switch to (VIN_LOCATIONS: blank /
+all = every one; "A03,NM4"; "all,-S01") and the files are merged into the one Drive
+file (common/vinculum_ui.export_all_locations, common/report_merge.py). VIN_DRY_RUN=true
+= export + merge without uploading.
+
+
 Run locally for testing:
     VIN_LOGIN_ID=Sonali VIN_PASSWORD=... GDRIVE_SERVICE_ACCOUNT_JSON='{...}' \
         python scripts/inventory_report_to_drive.py
@@ -24,7 +31,10 @@ from DrissionPage import ChromiumPage, ChromiumOptions
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from common.drive_utils import get_drive_service, upload_to_drive, get_latest_downloaded_file
-from common.vinculum_ui import LoginError, vinculum_login
+from common.report_merge import dry_run, keep_dry_run_copy, merge_for_upload, remove_files
+from common.vinculum_ui import (
+    LocationError, LoginError, dismiss_top_modals, export_all_locations, vinculum_login,
+)
 
 # ── SETTINGS ──────────────────────────────────────────────
 LOGIN_ID = os.environ.get("VIN_LOGIN_ID")
@@ -41,6 +51,7 @@ GDRIVE_FOLDER_ID = os.environ.get(
 LOCAL_DOWNLOAD_PATH = "/tmp/inventory_downloads"
 BASE = "https://nashermiles.vineretail.com/eRetailWeb"
 IST = ZoneInfo("Asia/Kolkata")
+_seen_report_ids = set()     # Pending Report ids already downloaded (earlier locations)
 
 
 def fail(message, code=1):
@@ -88,6 +99,63 @@ def main():
     except LoginError as e:
         page.quit()
         fail(str(e))
+    home_url = page.url
+
+    # ── STEPS 3-9 PER LOCATION, THEN MERGE (2026-10-19) ──
+    # Vinculum shows only the session's location: export every location the user can
+    # switch to (VIN_LOCATIONS) and merge them into the one Drive file.
+    print("\n[2b] Locations...")
+    drive_filename = datetime.now(IST).strftime("%d-%m-%Y_%H-%M")
+    parts, local_file = [], None
+    try:
+        parts = export_all_locations(page, BASE, lambda loc: _export_location(page, loc, home_url))
+        local_file, _total = merge_for_upload(parts, LOCAL_DOWNLOAD_PATH, drive_filename)
+    except LocationError as e:
+        page.quit()
+        fail(str(e))
+    page.quit()
+    if not local_file:
+        fail("No location returned an inventory file.")
+    if dry_run():
+        keep_dry_run_copy(local_file, os.environ.get("INVENTORY_DEBUG_DIR", "/tmp/inventory_debug"),
+                          drive_filename)
+        remove_files([p for _, p in parts] + [local_file])
+        return
+
+    # ── STEP 10: UPLOAD TO DRIVE + CLEAN UP ────────────────
+    print("\n[10] Uploading to Google Drive...")
+    uploaded_file_id = upload_to_drive(drive_service, local_file, drive_filename, GDRIVE_FOLDER_ID)
+    remove_files([p for _, p in parts] + [local_file])
+    if not uploaded_file_id:
+        fail("Drive upload failed. Check that the folder is shared with the service account's client_email.")
+    print(f"    Link: https://drive.google.com/file/d/{uploaded_file_id}/view")
+
+    print("\n" + "=" * 55)
+    print("  [✓] SUCCESS! Inventory Report uploaded to Google Drive as a Sheet.")
+    print(f"  Drive folder: https://drive.google.com/drive/folders/{GDRIVE_FOLDER_ID}")
+    print("=" * 55)
+
+
+ORG_LOC_JS = "var e = document.getElementById('orgLocKey'); return e ? e.value : '';"
+
+
+def _export_location(page, loc, home_url):
+    """Steps 3-9 for the session's current location (loc): returns the downloaded
+    file, or None when Vinculum has no inventory there."""
+    # Each location starts from the landing page (the WMS menu lives there); its
+    # hidden orgLocKey ("NM4_NASA") proves the location switch took.
+    if (page.url or "") != home_url:
+        page.get(home_url)
+        time.sleep(5)
+        dismiss_top_modals(page, "on the landing page")
+    try:
+        org_loc = (page.run_js(ORG_LOC_JS) or "").strip().upper()
+    except Exception:
+        org_loc = ""
+    print(f"    Landing page location key: {org_loc or '?'}")
+    if org_loc and not org_loc.startswith(loc.upper() + "_"):
+        page.quit()
+        fail(f"Landing page is on {org_loc}, not {loc} - the location switch did not take.")
 
     # ── STEP 3: NAVIGATE TO WMS > INVENTORY > INVENTORY VIEW ─
     print("\n[3] Navigating to WMS > Inventory > Inventory View...")
@@ -251,6 +319,7 @@ def main():
     print("\n[5/6] Searching and waiting for real inventory data...")
 
     data_ready = False
+    empty_every_try = True               # 'No data found' on every try = nothing at this location
     for attempt in range(1, MAX_SEARCH_TRIES + 1):
         print(f"\n    --- Search attempt {attempt}/{MAX_SEARCH_TRIES} ---")
 
@@ -259,6 +328,7 @@ def main():
             print(f"    [✓] {info}")
         else:
             print(f"    [!] Could not click Search ({info}) — retrying...")
+            empty_every_try = False
             time.sleep(2)
             continue
 
@@ -286,11 +356,15 @@ def main():
             time.sleep(3)
         else:
             print(f"    [!] Grid still empty after wait (data rows detected: {found_rows}) — retrying search...")
+            empty_every_try = False
             time.sleep(3)
 
+    if not data_ready and empty_every_try:
+        print(f"    [✓] {loc}: Vinculum says 'No data found' on every try - no inventory here.")
+        return None
     if not data_ready:
         page.quit()
-        fail("Grid never returned data after all retries. Not exporting an empty report.")
+        fail(f"{loc}: grid never returned data after all retries. Not exporting an empty report.")
 
     print("Waiting for AJAX to finish...")
     while True:
@@ -440,9 +514,12 @@ def main():
         file_id = info.get("fileId", "")
         status = info.get("status", "")
         elapsed = int(time.time() - start_time)
+        if report_id and report_id in _seen_report_ids:
+            status = f"(#{report_id} is an earlier location's report - waiting for this one)"
         print(f"[{elapsed:3d}s] Latest Report #{report_id}  Status: {status}")
 
         if status == "SUCCESS":
+            _seen_report_ids.add(report_id)
             print("\n[✓] SUCCESS — triggering downloadReport()...")
             pre_download_ts = time.time()
             clicked = pctx.run_js(f"""
@@ -478,34 +555,12 @@ def main():
         page.quit()
         fail(f"Report never downloaded within {MAX_WAIT_SECONDS}s.")
 
-    # ── STEP 10: UPLOAD TO DRIVE + CLEAN UP ────────────────
-    print("\n[10] Locating downloaded file and uploading to Google Drive...")
-    local_file = get_latest_downloaded_file(LOCAL_DOWNLOAD_PATH, since_ts=pre_download_ts)
-
+    local_file = downloaded_file or get_latest_downloaded_file(LOCAL_DOWNLOAD_PATH, since_ts=pre_download_ts)
     if not local_file:
         page.quit()
         fail(f"Could not find the downloaded file in {LOCAL_DOWNLOAD_PATH}.")
-
     print(f"    [✓] Found file: {local_file}")
-    drive_filename = datetime.now(IST).strftime("%d-%m-%Y_%H-%M")
-    uploaded_file_id = upload_to_drive(drive_service, local_file, drive_filename, GDRIVE_FOLDER_ID)
-
-    page.quit()
-
-    if not uploaded_file_id:
-        fail("Drive upload failed. Check that the folder is shared with the service account's client_email.")
-
-    print(f"    Link: https://drive.google.com/file/d/{uploaded_file_id}/view")
-    try:
-        os.remove(local_file)
-        print(f"    [✓] Local temp file deleted: {local_file}")
-    except Exception as e:
-        print(f"    [!] Could not delete local temp file: {e}")
-
-    print("\n" + "=" * 55)
-    print("  [✓] SUCCESS! Inventory Report uploaded to Google Drive as a Sheet.")
-    print(f"  Drive folder: https://drive.google.com/drive/folders/{GDRIVE_FOLDER_ID}")
-    print("=" * 55)
+    return local_file
 
 
 if __name__ == "__main__":

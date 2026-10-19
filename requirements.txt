@@ -8,3 +8,6 @@ google-auth-httplib2==0.4.4
 httplib2==0.32.0
 protobuf==7.36.2
 requests==2.34.2
+# 2026-10-19: merge the per-location .xlsx exports (common/report_merge.py).
+openpyxl==3.1.5
+et-xmlfile==2.0.0

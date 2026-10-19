@@ -3,7 +3,15 @@ name: Inventory Report to Drive
 on:
   schedule:
     - cron: "9 4 * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      locations:
+        description: >-
+          Vinculum locations to export and merge (2026-10-19): blank = the repo variable
+          VIN_LOCATIONS, else every location the login can switch to. "A03,NM4" = only
+          those; "all,-S01,-S02" = all but those.
+        required: false
+        default: ""
 
 # One Vinculum user for every report job: two sessions at once kill each other
 # (a run waits; note GitHub keeps only ONE waiting run per group).
@@ -14,7 +22,8 @@ concurrency:
 jobs:
   run-inventory-report:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Every location is exported and merged since 2026-10-19 (~2 min per location).
+    timeout-minutes: 120
 
     steps:
       - name: Checkout repo
@@ -33,4 +42,5 @@ jobs:
           VIN_LOGIN_ID: ${{ secrets.VIN_LOGIN_ID }}
           VIN_PASSWORD: ${{ secrets.VIN_PASSWORD }}
           GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+          VIN_LOCATIONS: ${{ inputs.locations || vars.VIN_LOCATIONS }}
         run: python scripts/inventory_report_to_drive.py
