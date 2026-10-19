@@ -312,6 +312,20 @@ def vinculum_part():
         dump_all(page, "HOME", "03_home")
         open_header_dropdowns(page, "03_home")
 
+        # "Switch Location" (header asterisk icon): openSwitchDialog() only loads
+        # selCompanyLocationBS?operation=switch into #changeCompanyIFrame. Nothing is
+        # chosen or submitted.
+        try:
+            page.run_js("if (window.openSwitchDialog) openSwitchDialog();"
+                        " if (window.jQuery) jQuery('#changeCompanyDialog').modal('show');")
+        except Exception as e:
+            out(f"  openSwitchDialog failed: {e!r}")
+        time.sleep(6)
+        dump_all(page, "SWITCH LOCATION DIALOG", "03b_switch_dialog")
+        page.get(f"{BASE}/selCompanyLocationBS?operation=switch")
+        time.sleep(5)
+        dump_all(page, "SWITCH LOCATION PAGE (opened directly)", "03c_switch_page")
+
         page.get(f"{BASE}/reportPickPackBS")
         time.sleep(5)
         dismiss_top_modals(page, "on Pick Pack")
@@ -326,7 +340,14 @@ def vinculum_part():
         time.sleep(5)
         dismiss_top_modals(page, "home again")
         out(f"\n  Order Enquiry menu: {click_menu_text(page, 'Order Enquiry')}")
-        time.sleep(6)
+        for _ in range(20):                       # the screen loads into a new iframe
+            time.sleep(1.5)
+            try:
+                if any("Ext Order No" in (fr.run_js("return document.body ? document.body.innerText : ''") or "")
+                       for fr in page.get_frames()):
+                    break
+            except Exception:
+                pass
         dismiss_top_modals(page, "on Order Enquiry")
         frames = dump_all(page, "ORDER ENQUIRY", "06_order_enquiry")
         # The advance-search panel only expands (no search is run).
