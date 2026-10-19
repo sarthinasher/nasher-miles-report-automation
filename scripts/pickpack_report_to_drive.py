@@ -42,8 +42,9 @@ from common import daily_export
 from common.report_dates import PICK_PACK_NAME, drive_filename, vinculum_date
 from common.report_merge import dry_run, keep_dry_run_copy, merge_for_upload, remove_files
 from common.vinculum_ui import (
-    check_site_location, dismiss_top_modals, export_all_locations, is_no_data_message,
-    launch_browser, read_page_message, save_debug_screenshot, set_report_date, vinculum_login,
+    SESSION_LOST_HINT, check_site_location, dismiss_top_modals, export_all_locations,
+    is_no_data_message, launch_browser, read_page_message, save_debug_screenshot, session_lost,
+    set_report_date, vinculum_login,
 )
 
 # ── SETTINGS ──────────────────────────────────────────────
@@ -66,6 +67,9 @@ TARGET_REPORT_NAME = "PickPackReport"
 # Pending-report rows already downloaded (or already there before this run's
 # request) - never taken as this date's report.
 _seen_rows = set()
+# {report date: {location: downloaded file or None}} - a retry (fresh browser) does not
+# export again the locations an earlier attempt already got.
+_location_files = {}
 
 
 class ExportError(Exception):
@@ -165,7 +169,8 @@ def _export_steps(page, drive_service, day):
     drive_name = drive_filename(day, *PICK_PACK_NAME)
     parts, local_file = [], None
     try:
-        parts = export_all_locations(page, BASE, lambda loc: _export_location(page, day, loc))
+        parts = export_all_locations(page, BASE, lambda loc: _export_location(page, day, loc),
+                                     done=_location_files.setdefault(day, {}))
         local_file, _total = merge_for_upload(parts, LOCAL_DOWNLOAD_PATH, drive_name)
         if not local_file:
             fail(f"No location returned a Pick Pack file for {vinculum_date(day)}.")
@@ -203,6 +208,8 @@ def _export_location(page, day, loc):
     page.get(f"{BASE}/reportPickPackBS")
     time.sleep(4)
     print(f"    URL: {page.url}")
+    if session_lost(page):
+        fail(f"Logged out of Vinculum: {SESSION_LOST_HINT}.")
     dismiss_top_modals(page, "on Pick Pack")
     if check_site_location(page, loc) is False:
         fail(f"Pick Pack's Site Location is not {loc} after switching location.")
@@ -249,6 +256,8 @@ def _export_location(page, day, loc):
     downloaded = False
     pre_download_ts = None
     while time.time() - start_time < MAX_WAIT_SECONDS:
+        if session_lost(page):
+            fail(f"Logged out of Vinculum while waiting for the report: {SESSION_LOST_HINT}.")
         info = read_row1(page)
         status, name, text = info.get("status", ""), info.get("name", ""), info.get("text", "")
         elapsed = int(time.time() - start_time)

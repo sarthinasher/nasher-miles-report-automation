@@ -33,7 +33,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from common.drive_utils import get_drive_service, upload_to_drive, get_latest_downloaded_file
 from common.report_merge import dry_run, keep_dry_run_copy, merge_for_upload, remove_files
 from common.vinculum_ui import (
-    LocationError, LoginError, dismiss_top_modals, export_all_locations, vinculum_login,
+    SESSION_LOST_HINT, LocationError, LoginError, dismiss_top_modals, export_all_locations,
+    session_lost, vinculum_login,
 )
 
 # ── SETTINGS ──────────────────────────────────────────────
@@ -153,6 +154,9 @@ def _export_location(page, loc, home_url):
     except Exception:
         org_loc = ""
     print(f"    Landing page location key: {org_loc or '?'}")
+    if session_lost(page):
+        page.quit()
+        fail(f"Logged out of Vinculum: {SESSION_LOST_HINT}.")
     if org_loc and not org_loc.startswith(loc.upper() + "_"):
         page.quit()
         fail(f"Landing page is on {org_loc}, not {loc} - the location switch did not take.")

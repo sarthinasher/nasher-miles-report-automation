@@ -633,6 +633,8 @@ def read_locations(page, base):
     except Exception as e:
         info = {"bad": f"JS_ERROR {e!r}", "options": [], "current": ""}
     if info.get("bad"):
+        if session_lost(page):
+            raise LocationError(f"Could not open the Switch Location page: {SESSION_LOST_HINT}.")
         raise LocationError(f"Could not read the Switch Location page ({info['bad']}).")
     return info
 
@@ -664,6 +666,8 @@ def switch_location(page, base, loc, tries=2):
             res = page.run_js(switch_location_js(loc))
         except Exception as e:
             res = f"ERR {e!r}"
+        if res != "SUBMITTING" and session_lost(page):
+            raise LocationError(f"Could not switch to {loc}: {SESSION_LOST_HINT}.")
         if res != "SUBMITTING":
             last = f"switch page said {res}"
             print(f"    [!] Switch to {loc} (try {attempt}): {last}")
@@ -745,26 +749,53 @@ def read_page_message(page, timeout=2):
         return ""
 
 
-def export_all_locations(page, base, export_one, spec=None):
+SESSION_LOST_HINT = ("the Vinculum session was ended - most likely the same user logged in "
+                     "somewhere else (each login ends the previous session). Use a login nobody "
+                     "else uses, or keep it out of Vinculum while the jobs run")
+
+
+def session_lost(page):
+    """True when Vinculum has sent the browser back to its login page."""
+    try:
+        return "eretaillogin" in (page.url or "").lower()
+    except Exception:
+        return False
+
+
+def export_all_locations(page, base, export_one, spec=None, done=None):
     """Runs export_one(loc) -> local file (or None = no data at loc) for every
     location VIN_LOCATIONS selects, switching the session location in between.
     Starts with the session's own location (one switch less) and switches back
-    to it at the end. Returns [(loc, file_or_None)] in export order. Any failure
-    (switch or export) raises: a partial merge is never uploaded."""
+    to it at the end. Returns [(loc, file_or_None)] in Vinculum's order.
+    done: a dict kept by the caller across attempts for the SAME report date:
+    locations already exported by an earlier attempt are not exported again.
+    Any failure (switch or export) raises: a partial merge is never uploaded."""
+    from common.report_merge import count_rows, read_rows
+    done = {} if done is None else done
     locs, original = plan_locations(page, base, spec)
-    order = ([original] if original in locs else []) + [x for x in locs if x != original]
-    parts, current = [], original
+    todo = [x for x in locs if not (x in done and (done[x] is None or os.path.exists(done[x])))]
+    if len(todo) < len(locs):
+        print(f"    Already exported by an earlier attempt: "
+              f"{', '.join(x for x in locs if x not in todo)}")
+    order = ([original] if original in todo else []) + [x for x in todo if x != original]
+    current = original
     try:
         for i, loc in enumerate(order, 1):
             print(f"\n  ── Location {loc} ({i}/{len(order)}) ──")
             if loc != current:
                 switch_location(page, base, loc)
                 current = loc
-            parts.append((loc, export_one(loc)))
+            path = export_one(loc)
+            if path:
+                try:
+                    print(f"    {loc}: {count_rows(read_rows(path)[1])} data row(s) in {os.path.basename(path)}")
+                except Exception as e:
+                    print(f"    {loc}: could not count rows ({e!r})")
+            done[loc] = path
     finally:
-        if original and current != original:
+        if original and current != original and not session_lost(page):
             try:
                 switch_location(page, base, original)
             except Exception as e:
                 print(f"    [!] Could not switch back to {original}: {e}")
-    return parts
+    return [(loc, done.get(loc)) for loc in locs]

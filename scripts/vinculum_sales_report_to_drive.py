@@ -44,8 +44,9 @@ from common import daily_export
 from common.report_dates import SALES_REPORT_NAME, drive_filename, vinculum_date
 from common.report_merge import dry_run, keep_dry_run_copy, merge_for_upload, remove_files
 from common.vinculum_ui import (
-    check_site_location, dismiss_top_modals, export_all_locations, is_no_data_message,
-    read_page_message, save_debug_screenshot, set_report_date, vinculum_login,
+    SESSION_LOST_HINT, check_site_location, dismiss_top_modals, export_all_locations,
+    is_no_data_message, read_page_message, save_debug_screenshot, session_lost, set_report_date,
+    vinculum_login,
 )
 
 # ── SETTINGS ──────────────────────────────────────────────
@@ -67,6 +68,9 @@ BASE = "https://nashermiles.vineretail.com/eRetailWeb"
 
 # Pending-report ids already used (or already there before this run's request).
 _seen_report_ids = set()
+# {report date: {location: downloaded file or None}} - a retry (fresh browser) does not
+# export again the locations an earlier attempt already got.
+_location_files = {}
 
 
 class ExportError(Exception):
@@ -260,7 +264,8 @@ def _export_steps(page, drive_service, day):
     drive_name = drive_filename(day, *SALES_REPORT_NAME)
     parts, local_file = [], None
     try:
-        parts = export_all_locations(page, BASE, lambda loc: _export_location(page, day, loc))
+        parts = export_all_locations(page, BASE, lambda loc: _export_location(page, day, loc),
+                                     done=_location_files.setdefault(day, {}))
         local_file, _total = merge_for_upload(parts, LOCAL_DOWNLOAD_PATH, drive_name)
         if not local_file:
             fail(f"No location returned a Sales Report file for {vinculum_date(day)}.")
@@ -297,6 +302,8 @@ def _export_location(page, day, loc):
     print("\n[4] Opening MIS Reports and selecting Sales Report...")
     page.get(f"{BASE}/displayCategoryAnalysisBS?posMenu=false")
     time.sleep(5)
+    if session_lost(page):
+        fail(f"Logged out of Vinculum: {SESSION_LOST_HINT}.")
     dismiss_top_modals(page, "on MIS Reports")
     if check_site_location(page, loc) is False:
         fail(f"The MIS report's Site Location is not {loc} after switching location.")
@@ -366,6 +373,8 @@ def _export_location(page, day, loc):
     downloaded = False
     pre_download_ts = None
     while time.time() - start_time < MAX_WAIT_SECONDS:
+        if session_lost(page):
+            fail(f"Logged out of Vinculum while waiting for the report: {SESSION_LOST_HINT}.")
         info = read_top_report(page)
         status, report_id, report_name = (info.get("status", ""), info.get("id", ""),
                                           info.get("name", ""))

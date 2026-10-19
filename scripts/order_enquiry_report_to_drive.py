@@ -50,8 +50,8 @@ from common.report_dates import (
 from common.report_dates import drive_filename as drive_filename_for
 from common.report_merge import dry_run, keep_dry_run_copy, merge_for_upload, remove_files
 from common.vinculum_ui import (
-    LoginError, dismiss_top_modals, export_all_locations, request_dialog_export,
-    select_all_export_fields, vinculum_login,
+    SESSION_LOST_HINT, LoginError, dismiss_top_modals, export_all_locations,
+    request_dialog_export, select_all_export_fields, session_lost, vinculum_login,
 )
 from common.vinculum_ui import launch_browser as _launch_browser
 from common.vinculum_ui import save_debug_screenshot as _save_debug_screenshot
@@ -80,6 +80,9 @@ RETRY_PAUSE_SECONDS = 30
 EXPORT_GAP_SECONDS = 130     # min time between two export requests in one process (see step 6)
 _last_export_request_ts = 0.0
 _seen_report_ids = set()     # Pending Report ids already used/seen by an earlier attempt
+# {report date: {location: downloaded file or None}} - a retry (fresh browser) does not
+# export again the locations an earlier attempt already got.
+_location_files = {}
 
 
 class ExportError(Exception):
@@ -148,7 +151,8 @@ def _run_steps(page, drive_service, report_day):
     parts, local_file = [], None
     try:
         parts = export_all_locations(
-            page, BASE, lambda loc: _export_location(page, report_day, loc, home_url))
+            page, BASE, lambda loc: _export_location(page, report_day, loc, home_url),
+            done=_location_files.setdefault(report_day, {}))
         local_file, _total = merge_for_upload(parts, LOCAL_DOWNLOAD_PATH, drive_filename)
         if not local_file:
             fail(f"No location returned an Order Enquiry file for {vinculum_date(report_day)}.")
@@ -199,6 +203,8 @@ def _export_location(page, report_day, loc, home_url):
     except Exception:
         org_loc = ""
     print(f"    Landing page location key: {org_loc or '?'}")
+    if session_lost(page):
+        fail(f"Logged out of Vinculum: {SESSION_LOST_HINT}.")
     if org_loc and not org_loc.startswith(loc.upper() + "_"):
         fail(f"Landing page is on {org_loc}, not {loc} - the location switch did not take.")
 
@@ -635,6 +641,8 @@ def _export_location(page, report_day, loc, home_url):
     time.sleep(5)
 
     while time.time() - start_time < MAX_WAIT_SECONDS:
+        if session_lost(page):
+            fail(f"Logged out of Vinculum while waiting for the report: {SESSION_LOST_HINT}.")
         pctx, _ = find_pending_ctx(max_wait=5)
         if pctx is None:
             pctx = page

@@ -131,3 +131,58 @@ def test_no_data_messages():
     for text in ("", None, "Report request submitted successfully", "Session expired",
                  "Report not found", "Print button not found", "0 records", "Notification"):
         assert not is_no_data_message(text), text
+
+
+# ── export_all_locations: order, switch-back, retry reuse (no browser) ──
+def _fake_vinculum(monkeypatch, locs, session):
+    import common.vinculum_ui as v
+    switches = []
+    monkeypatch.setattr(v, "plan_locations", lambda page, base, spec=None: (list(locs), session))
+    monkeypatch.setattr(v, "switch_location", lambda page, base, loc, tries=2: switches.append(loc))
+    monkeypatch.setattr(v, "session_lost", lambda page: False)
+    return v, switches
+
+
+def test_session_location_first_then_switch_back(monkeypatch, tmp_path):
+    v, switches = _fake_vinculum(monkeypatch, ["A03", "NM4", "S01"], "NM4")
+    exported = []
+
+    def export_one(loc):
+        exported.append(loc)
+        if loc == "S01":
+            return None
+        p = tmp_path / f"{loc}.csv"
+        p.write_text("Order No,Source WH\r\nX1," + loc + "\r\n")
+        return str(p)
+
+    parts = v.export_all_locations(None, "base", export_one)
+    assert exported == ["NM4", "A03", "S01"]          # no switch needed for NM4
+    assert switches == ["A03", "S01", "NM4"]          # ... and back to NM4 at the end
+    assert [loc for loc, _ in parts] == ["A03", "NM4", "S01"]
+    assert parts[2][1] is None
+
+
+def test_retry_skips_locations_an_earlier_attempt_exported(monkeypatch, tmp_path):
+    v, switches = _fake_vinculum(monkeypatch, ["A03", "NM4", "S01"], "NM4")
+    done_file = tmp_path / "A03.csv"
+    done_file.write_text("Order No\r\nX1\r\n")
+    done = {"A03": str(done_file), "S01": None}
+    exported = []
+    parts = v.export_all_locations(None, "base", lambda loc: exported.append(loc) or None, done=done)
+    assert exported == ["NM4"] and switches == []
+    assert dict(parts)["A03"] == str(done_file)
+
+
+def test_a_failed_location_raises_and_keeps_what_was_done(monkeypatch, tmp_path):
+    v, switches = _fake_vinculum(monkeypatch, ["A03", "NM4"], "NM4")
+    done = {}
+
+    def export_one(loc):
+        if loc == "A03":
+            raise RuntimeError("report never reached SUCCESS")
+        return None
+
+    with pytest.raises(RuntimeError):
+        v.export_all_locations(None, "base", export_one, done=done)
+    assert done == {"NM4": None}
+    assert switches == ["A03", "NM4"]                 # switched back even after the failure
