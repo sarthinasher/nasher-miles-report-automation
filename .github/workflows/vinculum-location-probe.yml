@@ -1,0 +1,50 @@
+name: Vinculum Location Probe (diagnostic)
+
+# 2026-10-19: read-only diagnostic. Logs in once, lists every location / warehouse
+# selector on the header, home, Pick Pack, Sales and Order Enquiry screens (options +
+# selected), counts rows per Source WH in a few Drive report files, and uploads
+# screenshots + redacted HTML. Saves nothing in Vinculum. Manual runs only.
+on:
+  workflow_dispatch: {}
+
+# One Vinculum user for every report job: two sessions at once kill each other.
+concurrency:
+  group: vinculum-session
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt pytest==9.1.1
+
+      - name: Run tests
+        run: python -m pytest tests -q
+
+      - name: Run Vinculum location probe
+        env:
+          VIN_LOGIN_ID: ${{ secrets.VIN_LOGIN_ID }}
+          VIN_PASSWORD: ${{ secrets.VIN_PASSWORD }}
+          GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+          PROBE_DIR: /tmp/vinculum_probe
+          PYTHONUNBUFFERED: "1"
+        run: python scripts/vinculum_location_probe.py
+
+      - name: Upload probe screenshots + HTML
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vinculum-location-probe
+          path: /tmp/vinculum_probe
+          if-no-files-found: ignore
