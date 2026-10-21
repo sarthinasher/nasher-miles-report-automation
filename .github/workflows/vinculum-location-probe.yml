@@ -26,7 +26,7 @@ on:
         required: false
         default: ""
       locations:
-        description: "dry_run only: VIN_LOCATIONS (blank = all the login can switch to)"
+        description: "dry_run only: VIN_LOCATIONS (blank = the script default; all = all 17)"
         required: false
         default: ""
 

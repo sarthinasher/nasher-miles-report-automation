@@ -48,8 +48,11 @@ from common.report_dates import (
     should_retry, vinculum_date,
 )
 from common.report_dates import drive_filename as drive_filename_for
-from common.report_merge import dry_run, keep_dry_run_copy, merge_for_upload, remove_files
+from common.report_merge import (
+    count_rows, dry_run, keep_dry_run_copy, merge_for_upload, read_rows, remove_files,
+)
 from common.vinculum_ui import (
+    LOCATIONS_WITH_ORDERS, location_spec,
     SESSION_LOST_HINT, LoginError, dismiss_top_modals, export_all_locations,
     request_dialog_export, select_all_export_fields, session_lost, vinculum_login,
 )
@@ -74,6 +77,9 @@ LOCAL_DOWNLOAD_PATH = "/tmp/order_enquiry_downloads"
 DEBUG_DIR = os.environ.get("ORDER_ENQUIRY_DEBUG_DIR", "/tmp/order_enquiry_debug")
 REPORT_NAME_MATCH = "OrderEnquiryExport"
 BASE = "https://nashermiles.vineretail.com/eRetailWeb"
+# Locations exported when VIN_LOCATIONS is not set (2026-10-21): the 6 that had orders
+# on 11-19 Oct (the other 11 had 0 every day).
+DEFAULT_LOCATIONS = LOCATIONS_WITH_ORDERS
 IST = ZoneInfo("Asia/Kolkata")
 MAX_ATTEMPTS = int(os.environ.get("ORDER_ENQUIRY_MAX_ATTEMPTS", "2"))   # per report date
 RETRY_PAUSE_SECONDS = 30
@@ -152,8 +158,10 @@ def _run_steps(page, drive_service, report_day):
     try:
         parts = export_all_locations(
             page, BASE, lambda loc: _export_location(page, report_day, loc, home_url),
-            done=_location_files.setdefault(report_day, {}))
-        local_file, _total = merge_for_upload(parts, LOCAL_DOWNLOAD_PATH, drive_filename)
+            done=_location_files.setdefault(report_day, {}),
+            spec=location_spec(DEFAULT_LOCATIONS))
+        local_file, _total = merge_for_upload(parts, LOCAL_DOWNLOAD_PATH, drive_filename,
+                                              required_columns=OE_REQUIRED_COLUMNS)
         if not local_file:
             fail(f"No location returned an Order Enquiry file for {vinculum_date(report_day)}.")
         if dry_run():
@@ -187,6 +195,9 @@ GRID_RECORDS_JS = """
 """
 
 ORG_LOC_JS = "var e = document.getElementById('orgLocKey'); return e ? e.value : '';"
+
+# What nasher-fms-automation's Order Enquiry reader needs ("Extern OrderNo" -> ExtOrderNo).
+OE_REQUIRED_COLUMNS = ["Order No", "Extern OrderNo", "Order Date", "Status"]
 
 
 def _export_location(page, report_day, loc, home_url):
@@ -694,6 +705,14 @@ def _export_location(page, report_day, loc, home_url):
     if not local_file:
         fail(f"Could not find the downloaded file in {LOCAL_DOWNLOAD_PATH}.")
     print(f"    [✓] Found file: {local_file}")
+    # The export must hold every order the grid showed (2026-10-21: misread files
+    # with 0 rows were merged and uploaded).
+    try:
+        n_file = count_rows(read_rows(local_file)[1])
+    except Exception as e:
+        fail(f"{loc}: could not read the exported file ({e!r}).")
+    if isinstance(n_orders, (int, float)) and n_file < n_orders:
+        fail(f"{loc}: exported file has {n_file} order row(s) but the grid showed {n_orders}.")
     return local_file
 
 

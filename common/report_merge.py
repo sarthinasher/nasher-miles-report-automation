@@ -116,11 +116,15 @@ def read_csv_rows(path):
 
 
 def read_xlsx_rows(path):
-    """(sheet title, rows) of the FIRST sheet."""
+    """(sheet title, rows) of the FIRST sheet.
+    2026-10-21: Vinculum's Order Enquiry .xlsx declares <dimension ref="A1"/>; read-only
+    openpyxl trusts it and returned only cell A1 (merged files had just "Order No", 0 rows).
+    reset_dimensions() makes it read every cell that is really there."""
     from openpyxl import load_workbook
     wb = load_workbook(path, read_only=True, data_only=True)
     try:
         ws = wb.worksheets[0]
+        ws.reset_dimensions()
         return ws.title, [list(r) for r in ws.iter_rows(values_only=True)]
     finally:
         wb.close()
@@ -177,6 +181,7 @@ def merge_location_files(parts, out_path):
     title, tables = None, []
     for loc, p in files:
         t, rows = read_rows(p)
+        check_readable(loc, p, rows)
         title = title or t
         tables.append((loc, rows))
     header, rows, counts, dropped = merge_tables(tables)
@@ -201,13 +206,41 @@ def log_merge(name, counts, total, dropped, order=None):
           + (f" ({dropped} duplicate row(s) seen in an earlier location dropped)" if dropped else ""))
 
 
-def merge_for_upload(parts, work_dir, drive_name):
+def check_readable(loc, path, rows):
+    """Every Vinculum report has many columns: a file read as ONE column (or none) was
+    misread (the 2026-10-21 Order Enquiry regression) - refuse rather than upload it."""
+    rows = [_trim(r) for r in rows or []]
+    while rows and not rows[0]:
+        rows.pop(0)
+    if not rows:
+        return
+    named = [h for h in rows[0] if not _blank(h)]
+    if len(named) < 2:
+        raise MergeError(f"{loc}: only {len(named)} column(s) read from {os.path.basename(path)} "
+                         f"(header {rows[0]!r}) - the file was misread; not merging it.")
+
+
+def check_columns(path, required):
+    """MergeError unless the file's header has every required column (as the
+    downstream readers expect them)."""
+    _, rows = read_rows(path)
+    header = [("" if h is None else str(h).strip()) for h in (rows[0] if rows else [])]
+    missing = [c for c in required if c not in header]
+    if missing:
+        raise MergeError(f"{os.path.basename(path)} lacks column(s) {missing} "
+                         f"(has {len(header)} columns) - not uploading it.")
+
+
+def merge_for_upload(parts, work_dir, drive_name, required_columns=None):
     """Merges the per-location files for one Drive file and logs the per-location
-    row counts. Returns (path_to_upload or None, total_rows)."""
+    row counts. Returns (path_to_upload or None, total_rows). required_columns:
+    column names the uploaded file must have (else MergeError)."""
     safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in drive_name)
     out = os.path.join(work_dir, f"merged_{safe}")
     path, counts, total, dropped = merge_location_files(parts, out)
     log_merge(drive_name, counts, total, dropped, order=[loc for loc, _ in parts])
+    if path and required_columns:
+        check_columns(path, required_columns)
     return path, total
 
 

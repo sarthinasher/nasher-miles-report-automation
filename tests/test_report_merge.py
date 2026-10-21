@@ -150,3 +150,77 @@ def test_xlsx_files_merge_keeping_the_sheet_name(tmp_path):
     assert title == "Export"
     assert rows == [list(oe), ["M1", 100.5, "Shipped"], ["M2", 20, "Allocated"]]
     assert counts == {"NM4": 1, "A03": 1} and total == 2 and dropped == 1
+
+
+# ── 2026-10-21 regression: Vinculum's Order Enquiry .xlsx declares a wrong sheet size ──
+# Every merged OrderEnquiry_ file of 19/20-Oct had ONLY the "Order No" column and 0 rows:
+# openpyxl's read-only mode trusts the sheet's <dimension ref="A1"/> and read column A of
+# row 1 only. Below: a realistic 39-column export with that bad dimension tag.
+OE_COLUMNS = [
+    "Order No", "Extern OrderNo", "Order Date", "Order Type", "Status", "Order Amount",
+    "Voucher Code", "Voucher Amount", "Payment GateWay", "Store Credit", "Shipping Charges",
+    "On Hold", "Verification Status", "Ship Date", "Delivery Date", "Original Order No",
+    "Ext Original OrderNo", "IS Replacement Order", "Customer Name", "Bill Address",
+    "Bill City", "Bill PinCode", "Bill State", "Bill Country", "Bill Email", "Bill Phone",
+    "Ship Address", "Ship City", "Ship PinCode", "Ship State", "Ship Country", "Ship Email",
+    "Ship Phone", "Sub Order ID", "Ship By Date", "App Tag", "Pickup Location",
+    "Is Click & Collect", "Distribution Type",
+]
+
+
+def _vinculum_oe_xlsx(path, orders, dimension="A1"):
+    import re
+    import shutil
+    import zipfile
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Export"
+    ws.append(OE_COLUMNS)
+    for i, (order_no, ext) in enumerate(orders):
+        row = [""] * len(OE_COLUMNS)
+        row[0], row[1], row[2], row[4] = order_no, ext, "15/10/2026 11:36 PM", "Shipped complete"
+        row[5] = "3359.00"
+        ws.append(row)
+    tmp = str(path) + ".tmp"
+    wb.save(tmp)
+    with zipfile.ZipFile(tmp) as zin, zipfile.ZipFile(str(path), "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename.startswith("xl/worksheets/sheet"):
+                data = re.sub(rb'<dimension ref="[^"]*"\s*/>', f'<dimension ref="{dimension}"/>'.encode(),
+                              data)
+            zout.writestr(item, data)
+    shutil.os.remove(tmp)
+    return str(path)
+
+
+def test_order_enquiry_xlsx_with_a_wrong_dimension_keeps_all_39_columns_and_rows(tmp_path):
+    nm4 = _vinculum_oe_xlsx(tmp_path / "nm4.xlsx", [("M2743", "NYK-1"), ("M108085", "OD43")])
+    a03 = _vinculum_oe_xlsx(tmp_path / "a03.xlsx", [("O1", "GT141026A1")])
+    title, rows = read_xlsx_rows(nm4)
+    assert rows[0] == OE_COLUMNS and len(rows) == 3
+    path, counts, total, _ = merge_location_files([("NM4", nm4), ("A03", a03)],
+                                                  str(tmp_path / "merged"))
+    title, rows = read_xlsx_rows(path)
+    assert title == "Export"
+    assert rows[0] == OE_COLUMNS                       # Extern OrderNo / Order Date / Status kept
+    assert [r[0] for r in rows[1:]] == ["M2743", "M108085", "O1"]
+    assert rows[3][1] == "GT141026A1" and rows[3][4] == "Shipped complete"
+    assert counts == {"NM4": 2, "A03": 1} and total == 3
+
+
+def test_a_file_read_as_one_column_is_refused(tmp_path):
+    a = _csv(tmp_path / "a.csv", [["Order No"], ["M1"]])
+    b = _csv(tmp_path / "b.csv", [PP_HEADER, ["O1", "C", "1", "A03"]])
+    with pytest.raises(MergeError):
+        merge_location_files([("NM4", a), ("A03", b)], str(tmp_path / "merged"))
+
+
+def test_required_columns_are_checked(tmp_path):
+    from common.report_merge import check_columns
+    ok = _csv(tmp_path / "ok.csv", [["Order No", "Extern OrderNo", "Order Date", "Status"], ["M1", "X", "d", "s"]])
+    check_columns(ok, ["Order No", "Extern OrderNo", "Order Date", "Status"])
+    bad = _csv(tmp_path / "bad.csv", [["Order No", "Order Type"], ["M1", "COD"]])
+    with pytest.raises(MergeError):
+        check_columns(bad, ["Order No", "Extern OrderNo", "Order Date", "Status"])

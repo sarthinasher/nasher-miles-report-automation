@@ -186,3 +186,13 @@ def test_a_failed_location_raises_and_keeps_what_was_done(monkeypatch, tmp_path)
         v.export_all_locations(None, "base", export_one, done=done)
     assert done == {"NM4": None}
     assert switches == ["A03", "NM4"]                 # switched back even after the failure
+
+
+def test_location_spec_env_overrides_the_script_default(monkeypatch):
+    from common.vinculum_ui import LOCATIONS_WITH_ORDERS, location_spec
+    monkeypatch.delenv("VIN_LOCATIONS", raising=False)
+    assert location_spec(LOCATIONS_WITH_ORDERS) == "A03,GJ1,NM1,NM4,NM7,NM9"
+    monkeypatch.setenv("VIN_LOCATIONS", "  ")
+    assert location_spec("all") == "all"
+    monkeypatch.setenv("VIN_LOCATIONS", "all")
+    assert location_spec(LOCATIONS_WITH_ORDERS) == "all"

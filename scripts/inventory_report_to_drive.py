@@ -33,6 +33,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from common.drive_utils import get_drive_service, upload_to_drive, get_latest_downloaded_file
 from common.report_merge import dry_run, keep_dry_run_copy, merge_for_upload, remove_files
 from common.vinculum_ui import (
+    location_spec,
     SESSION_LOST_HINT, LocationError, LoginError, dismiss_top_modals, export_all_locations,
     session_lost, vinculum_login,
 )
@@ -51,6 +52,9 @@ GDRIVE_FOLDER_ID = os.environ.get(
 
 LOCAL_DOWNLOAD_PATH = "/tmp/inventory_downloads"
 BASE = "https://nashermiles.vineretail.com/eRetailWeb"
+# Locations exported when VIN_LOCATIONS is not set: all of them (stock can sit at a
+# location that has no orders).
+DEFAULT_LOCATIONS = "all"
 IST = ZoneInfo("Asia/Kolkata")
 _seen_report_ids = set()     # Pending Report ids already downloaded (earlier locations)
 
@@ -109,7 +113,8 @@ def main():
     drive_filename = datetime.now(IST).strftime("%d-%m-%Y_%H-%M")
     parts, local_file = [], None
     try:
-        parts = export_all_locations(page, BASE, lambda loc: _export_location(page, loc, home_url))
+        parts = export_all_locations(page, BASE, lambda loc: _export_location(page, loc, home_url),
+                                     spec=location_spec(DEFAULT_LOCATIONS))
         local_file, _total = merge_for_upload(parts, LOCAL_DOWNLOAD_PATH, drive_filename)
     except LocationError as e:
         page.quit()

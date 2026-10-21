@@ -1,0 +1,38 @@
+# Merged Order Enquiry / Sales files have only "Order No" (or nothing) and 0 rows; GT FMS fills nothing
+
+- **Date:** 2026-10-21
+- **Reported as:** "URGENT regression from your multi-location change (89d6fc0/ed56093), now live: every Order Enquiry file written with it (OrderEnquiry_11-10-2026 ... 19-10-2026) now has ONLY an 'Order No' column, fileSize 1024. GT FMS Automation has FAILED on every run since 19-Oct evening: `WARNING: Order Enquiry file skipped, missing columns ['ExtOrderNo', 'Order Date', 'Status']: OrderEnquiry_19-10-2026 [gsheet] (has: ['Order No'])` ... filled from Order Enquiry: 0." Also: scheduled Sales / Inventory runs are being cancelled.
+- **Symptom:**
+  - Drive folder `1rinwTyd3BseS7o_FHP4Y907egQz39zBO`: `OrderEnquiry_14/15/16/18/19-10-2026` (and the rest of 11-19) are 1024-byte Sheets with one column, `Order No`, and no rows.
+  - Sales folder `1iL94fl0nUOxZ_pEWH_AuxnqBYsYjsjt_`: `14.10.2026`, `15.10.2026`, `16.10.2026`, `18.10.2026` are ~1.5 KB, written 20/21-Oct by the same code.
+  - Back-fill run 39264474236: `NM7: Order Enquiry grid shows 206 order(s) for 11/10/2026` then `NM7: 0 data row(s) in ...xlsx`, the same for every location and date, `OrderEnquiry_11-10-2026: rows per location -> ... | total 0`. Sales run 39396241597: `NM4: 0 data row(s) in VIN_REP_168_...xlsx` for all 17 locations, `13.10.2026: ... total 0`, then retries until the 350-min timeout.
+  - Pick Pack (CSV) is fine: `PickPackReport_19.10.2026` 440 rows, `20.10.2026` 164 rows.
+- **Where:** `common/report_merge.py` `read_xlsx_rows` (added in 89d6fc0): `load_workbook(path, read_only=True)` then `ws.iter_rows(values_only=True)`.
+- **Root cause:** Vinculum's .xlsx exports (Order Enquiry `Export` sheet, MIS `Sales Report`) declare a wrong sheet size, `<dimension ref="A1"/>`. openpyxl's read-only mode trusts that tag, so it returned cell A1 only: header `["Order No"]` (Sales: the first header cell) and no data rows. The merge then wrote that one-cell table and uploaded it over the good file. Pick Pack and Inventory are CSV and were not affected. Nothing checked that the merged file still had the downstream columns or as many rows as the grid showed.
+- **Why it wasn't caught:** the unit tests built their .xlsx with openpyxl, which writes a correct dimension tag, so they passed. The live Order Enquiry/Sales path was never dry-run: both dry runs were Pick Pack (CSV), and the Order Enquiry/Sales "0 data row(s)" log lines raised no error.
+- **Fix:**
+  - `read_xlsx_rows` calls `ws.reset_dimensions()`, so read-only openpyxl reads every cell that is really in the sheet.
+  - `report_merge.check_readable`: a file read as fewer than 2 named columns is refused (MergeError), not merged. This applies to every report.
+  - `merge_for_upload(..., required_columns=...)`: Order Enquiry refuses to upload unless the file has `Order No`, `Extern OrderNo`, `Order Date` and `Status`. nasher-fms-automation's `normalize_sales_header` maps "Extern OrderNo" to ExtOrderNo, and the pre-change files (e.g. `OrderEnquiry_09-10-2026`) have exactly these 39 columns.
+  - Order Enquiry fails a location whose exported file has fewer rows than its grid showed.
+  - Tests: `tests/test_report_merge.py::test_order_enquiry_xlsx_with_a_wrong_dimension_keeps_all_39_columns_and_rows`. It builds a realistic 39-column Vinculum export with `<dimension ref="A1"/>`, failed before the fix (`['Order No'] == [...]`) and passes now. Also new: tests for one-column refusal and required columns. 78 tests pass.
+  - Schedules (the cancelled runs): GitHub keeps only one waiting run per `vinculum-session` group and cancels the older one, and 17-location loops held the group for 30 min to 6 h (the 6-h Sales runs were this bug, retrying). Changes:
+    - Pick Pack and Order Enquiry now default to `LOCATIONS_WITH_ORDERS = A03,GJ1,NM1,NM4,NM7,NM9` (`common/vinculum_ui.py`). These are the only locations with any Pick Pack line or Order Enquiry order in the 19/20-Oct runs; the run logs the excluded ones.
+    - Sales and Inventory keep "all" (stores may have POS sales; stock can sit anywhere).
+    - Inventory cron moved 04:09 -> 05:15 UTC so it no longer lands while Sales (03:40) / Order Enquiry (04:35) hold the group.
+    - `VIN_LOCATIONS` / the `locations` input still override (`all` = 17).
+- **Evidence:** per-location rows from the live runs:
+  - Pick Pack 19/10 (run 39394101857): A03=28, GJ1=26, NM1=125, NM4=55, NM7=164, NM9=42, all other 11 = 0 (total 440).
+  - Pick Pack 20/10 (run 39570271338): A03=7, NM1=70, NM4=14, NM7=73, others 0.
+  - Order Enquiry grid counts: 11/10: NM4=33, A03=73, GJ1=21, NM1=122, NM7=206, NM9=93, the other 11 = 0. 12/10: NM4=26, A03=43, GJ1=10, NM1=104, NM7=162, NM9=70, others 0.
+- **Blast radius:**
+  - `OrderEnquiry_11-10` ... `19-10-2026` and probably `20-10-2026` (pending run 39577367558 on the old commit), Sales `14.10`, `15.10`, `16.10`, `18.10.2026` (and any further date the in-progress Sales run 39572252190, also on the old commit, writes).
+  - GT FMS Automation filled nothing from Order Enquiry since 19-Oct.
+  - Sync Sales to SharePoint may push the broken Sales files.
+- **Still open:**
+  - Cancel runs 39572252190 (Sales, in progress) and 39577367558 (Order Enquiry, pending). Both run commit 70cddd4 and will write more broken files.
+  - One Order Enquiry dry run on the fixed code.
+  - Back-fills of Order Enquiry 11-20/10 and Sales 13-20/10 (overwrite the broken files), then GT FMS Automation; check the SharePoint copies of the Sales dates.
+  - Per-location Sales / Inventory counts, to trim their location lists.
+  - The admin mapping / dedicated-user items in 2026-10-19-new-vinculum-login-exports-only-nm4.md.
+- **Related:** 2026-10-19-new-vinculum-login-exports-only-nm4.md (the change that introduced this).

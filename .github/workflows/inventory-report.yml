@@ -2,14 +2,18 @@ name: Inventory Report to Drive
 
 on:
   schedule:
-    - cron: "9 4 * * *"
+    # 05:15 UTC (10:45 IST), was 04:09: it now runs ~35 min (17 locations) and must not
+    # land while Sales (03:40) / Order Enquiry (04:35) hold the vinculum-session group -
+    # GitHub keeps one waiting run per group and cancels the older one (2026-10-21).
+    - cron: "15 5 * * *"
   workflow_dispatch:
     inputs:
       locations:
         description: >-
-          Vinculum locations to export and merge (2026-10-19): blank = the repo variable
-          VIN_LOCATIONS, else every location the login can switch to. "A03,NM4" = only
-          those; "all,-S01,-S02" = all but those.
+          Vinculum locations to export and merge: blank = the repo variable
+          VIN_LOCATIONS, else the script's default (Pick Pack / Order Enquiry: the 6 with
+          orders, A03,GJ1,NM1,NM4,NM7,NM9; Sales / Inventory: all). "all" = all 17;
+          "A03,NM4" = only those; "all,-S01,-S02" = all but those.
         required: false
         default: ""
 

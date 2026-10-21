@@ -44,6 +44,7 @@ from common import daily_export
 from common.report_dates import SALES_REPORT_NAME, drive_filename, vinculum_date
 from common.report_merge import dry_run, keep_dry_run_copy, merge_for_upload, remove_files
 from common.vinculum_ui import (
+    location_spec,
     SESSION_LOST_HINT, check_site_location, dismiss_top_modals, export_all_locations,
     is_no_data_message, read_page_message, save_debug_screenshot, session_lost, set_report_date,
     vinculum_login,
@@ -64,6 +65,9 @@ GDRIVE_FOLDER_ID = os.environ.get(
 )
 
 BASE = "https://nashermiles.vineretail.com/eRetailWeb"
+# Locations exported when VIN_LOCATIONS is not set: all of them - the stores (S01-S03)
+# may invoice POS sales; no per-location Sales counts exist yet (2026-10-21).
+DEFAULT_LOCATIONS = "all"
 
 
 # Pending-report ids already used (or already there before this run's request).
@@ -265,7 +269,8 @@ def _export_steps(page, drive_service, day):
     parts, local_file = [], None
     try:
         parts = export_all_locations(page, BASE, lambda loc: _export_location(page, day, loc),
-                                     done=_location_files.setdefault(day, {}))
+                                     done=_location_files.setdefault(day, {}),
+                                     spec=location_spec(DEFAULT_LOCATIONS))
         local_file, _total = merge_for_upload(parts, LOCAL_DOWNLOAD_PATH, drive_name)
         if not local_file:
             fail(f"No location returned a Sales Report file for {vinculum_date(day)}.")

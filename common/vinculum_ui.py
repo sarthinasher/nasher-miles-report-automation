@@ -639,10 +639,23 @@ def read_locations(page, base):
     return info
 
 
+# 2026-10-21: the only locations with any Pick Pack line or Order Enquiry order in the
+# 17-location runs of 19/20-Oct (11-20 Oct data): every other location was 0 on every
+# date. Pick Pack and Order Enquiry default to these (6 exports instead of 17 per date,
+# so the jobs finish before the next one is due); VIN_LOCATIONS overrides ("all" = 17).
+LOCATIONS_WITH_ORDERS = "A03,GJ1,NM1,NM4,NM7,NM9"
+
+
+def location_spec(default=""):
+    """VIN_LOCATIONS when set (workflow input / repo variable), else the script's default."""
+    env = (os.environ.get("VIN_LOCATIONS") or "").strip()
+    return env if env else default
+
+
 def plan_locations(page, base, spec=None):
     """Logs every location the user can switch to; returns (codes_to_export,
     session_location). Call right after vinculum_login."""
-    spec = os.environ.get("VIN_LOCATIONS", "") if spec is None else spec
+    spec = location_spec() if spec is None else spec
     info = read_locations(page, base)
     names = {c.strip().upper(): n for c, n in info["options"]}
     current = (info.get("current") or info.get("selected") or "").strip().upper()
@@ -650,7 +663,11 @@ def plan_locations(page, base, spec=None):
           + ", ".join(f"{c} ({n})" for c, n in names.items()))
     print(f"    Session location after login: {current or '?'}")
     chosen = resolve_locations(list(names), spec)
-    print(f"    VIN_LOCATIONS={spec!r} -> exporting {len(chosen)} location(s): {', '.join(chosen)}")
+    print(f"    Locations {spec!r} -> exporting {len(chosen)} location(s): {', '.join(chosen)}")
+    skipped = [c for c in names if c not in chosen]
+    if skipped:
+        print(f"    Not exported (not in the list; set VIN_LOCATIONS=all to include): "
+              f"{', '.join(skipped)}")
     return chosen, current
 
 

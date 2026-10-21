@@ -42,6 +42,7 @@ from common import daily_export
 from common.report_dates import PICK_PACK_NAME, drive_filename, vinculum_date
 from common.report_merge import dry_run, keep_dry_run_copy, merge_for_upload, remove_files
 from common.vinculum_ui import (
+    LOCATIONS_WITH_ORDERS, location_spec,
     SESSION_LOST_HINT, check_site_location, dismiss_top_modals, export_all_locations,
     is_no_data_message, launch_browser, read_page_message, save_debug_screenshot, session_lost,
     set_report_date, vinculum_login,
@@ -62,6 +63,9 @@ GDRIVE_FOLDER_ID = os.environ.get(
 )
 
 BASE = "https://nashermiles.vineretail.com/eRetailWeb"
+# Locations exported when VIN_LOCATIONS is not set (2026-10-21): the 6 that had Pick
+# Pack lines on 19/20-Oct (the other 11 had none).
+DEFAULT_LOCATIONS = LOCATIONS_WITH_ORDERS
 TARGET_REPORT_NAME = "PickPackReport"
 
 # Pending-report rows already downloaded (or already there before this run's
@@ -170,7 +174,8 @@ def _export_steps(page, drive_service, day):
     parts, local_file = [], None
     try:
         parts = export_all_locations(page, BASE, lambda loc: _export_location(page, day, loc),
-                                     done=_location_files.setdefault(day, {}))
+                                     done=_location_files.setdefault(day, {}),
+                                     spec=location_spec(DEFAULT_LOCATIONS))
         local_file, _total = merge_for_upload(parts, LOCAL_DOWNLOAD_PATH, drive_name)
         if not local_file:
             fail(f"No location returned a Pick Pack file for {vinculum_date(day)}.")
