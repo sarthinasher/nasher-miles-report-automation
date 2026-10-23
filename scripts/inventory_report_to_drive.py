@@ -35,7 +35,7 @@ from common.report_merge import dry_run, keep_dry_run_copy, merge_for_upload, re
 from common.vinculum_ui import (
     location_spec,
     SESSION_LOST_HINT, LocationError, LoginError, dismiss_top_modals, export_all_locations,
-    session_lost, vinculum_login,
+    remember_latest_report, session_lost, vinculum_login,
 )
 
 # ── SETTINGS ──────────────────────────────────────────────
@@ -56,7 +56,7 @@ BASE = "https://nashermiles.vineretail.com/eRetailWeb"
 # location that has no orders).
 DEFAULT_LOCATIONS = "all"
 IST = ZoneInfo("Asia/Kolkata")
-_seen_report_ids = set()     # Pending Report ids already downloaded (earlier locations)
+_seen_report_ids = set()     # Pending Report ids not to take: downloaded, or there before this run
 
 
 def fail(message, code=1):
@@ -105,6 +105,9 @@ def main():
         page.quit()
         fail(str(e))
     home_url = page.url
+    # 2026-10-23: the newest InvViewBySkuBin from before this run (yesterday's stock) is
+    # never taken as the first location's report.
+    remember_latest_report(page, BASE, "InvViewBySkuBin", _seen_report_ids)
 
     # ── STEPS 3-9 PER LOCATION, THEN MERGE (2026-10-19) ──
     # Vinculum shows only the session's location: export every location the user can

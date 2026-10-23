@@ -809,6 +809,64 @@ def session_lost(page):
         return False
 
 
+# ── Reports that existed before this run (2026-10-23) ────────
+# Inventory takes the newest SUCCESS InvViewBySkuBin row of the Pending Report grid as
+# the report it just requested; only ids it downloaded itself were excluded, so for the
+# FIRST location the previous run's report (yesterday's stock) was taken if this run's
+# request had not registered. remember_latest_report marks the newest existing row as
+# seen before the first export. See
+# "Errors and their fixes/2026-10-23-inventory-first-location-stale-report.md".
+def latest_report_js(name_match):
+    """JS -> JSON {id, status} of the highest-id Pending Report row whose report name
+    (5th cell) contains name_match, or {id: ""}."""
+    return f"""
+        try {{
+            var latest = null;
+            var rows = document.querySelectorAll('tr[role="row"]');
+            for (var row of rows) {{
+                var cells = row.querySelectorAll("td");
+                if (cells.length < 5) continue;
+                if (cells[4].innerText.trim().indexOf({json.dumps(name_match)}) === -1) continue;
+                var id = cells[0].innerText.trim();
+                var idNum = parseInt(id.replace(/,/g, ""), 10);
+                if (isNaN(idNum)) continue;
+                if (latest == null || idNum > latest.idNum)
+                    latest = {{idNum: idNum, id: id, status: cells[1].innerText.trim()}};
+            }}
+            return JSON.stringify(latest || {{id: ""}});
+        }} catch (e) {{ return JSON.stringify({{id: "", error: e.toString()}}); }}
+    """
+
+
+def remember_latest_report(page, base, name_match, seen, wait=5):
+    """Opens the Pending Report page and adds the id of the newest name_match report
+    (in the page or any iframe) to seen. Never raises: returns the id or ''."""
+    js = latest_report_js(name_match)
+    try:
+        page.get(f"{base}/pendingDisplay")
+        time.sleep(wait)
+        contexts = [page]
+        try:
+            contexts += list(page.get_frames())
+        except Exception:
+            pass
+        for ctx in contexts:
+            try:
+                info = json.loads(ctx.run_js(js) or "{}")
+            except Exception:
+                continue
+            rid = str(info.get("id") or "").strip()
+            if rid:
+                seen.add(rid)
+                print(f"    Newest {name_match} before this run: #{rid} ({info.get('status', '')}) "
+                      f"- never taken as this run's report")
+                return rid
+        print(f"    No earlier {name_match} in Pending Reports.")
+    except Exception as e:
+        print(f"    [!] Could not read Pending Reports before the export ({e!r}).")
+    return ""
+
+
 def _log_location_rows(loc, path):
     from common.report_merge import count_rows, read_rows
     if not path:
