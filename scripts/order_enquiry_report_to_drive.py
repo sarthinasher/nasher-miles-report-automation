@@ -52,7 +52,7 @@ from common.report_merge import (
     count_rows, dry_run, keep_dry_run_copy, merge_for_upload, read_rows, remove_attempt_files,
 )
 from common.vinculum_ui import (
-    LOCATIONS_WITH_ORDERS, location_spec,
+    LOCATIONS_WITH_ORDERS, PARSE_IST_TIMESTAMP_JS, location_spec,
     SESSION_LOST_HINT, LoginError, dismiss_top_modals, export_all_locations,
     request_dialog_export, select_all_export_fields, session_lost, vinculum_login,
 )
@@ -598,14 +598,7 @@ def _export_location(page, report_day, loc, home_url):
     def get_latest_report(run_start_epoch_ms):
         raw = pctx.run_js(f"""
             try {{
-                function parseTs(s){{
-                    var m = s.match(/(\\d{{2}})\\/(\\d{{2}})\\/(\\d{{4}})\\s+(\\d{{1,2}}):(\\d{{2}})\\s*(AM|PM)/i);
-                    if (!m) return 0;
-                    var d=+m[1], mo=+m[2], y=+m[3], hh=+m[4], mm=+m[5], ap=m[6].toUpperCase();
-                    if (ap==='PM' && hh<12) hh+=12;
-                    if (ap==='AM' && hh===12) hh=0;
-                    return new Date(y, mo-1, d, hh, mm, 0).getTime();
-                }}
+                {PARSE_IST_TIMESTAMP_JS}
                 var rows = document.querySelectorAll('tr[role="row"]');
                 var latest = null;
                 for (var row of rows) {{

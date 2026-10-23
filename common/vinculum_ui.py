@@ -179,6 +179,24 @@ def vinculum_login(page, base, login_id, password, org_id=""):
     print("[✓] Login successful!")
 
 
+# ── Pending Report request times (2026-10-23) ────────────────
+# The Pending Report grid shows request times in IST ("23/10/2026 02:03 PM" at 08:33
+# UTC), but the CI browser runs in UTC: `new Date(y, mo, d, hh, mm)` read them as UTC,
+# 5h30 too late, so the "requested before this run" filter let through every report of
+# the last ~5.5 h. parseTs returns the real epoch ms, whatever the browser's time zone.
+# See "Errors and their fixes/2026-10-23-pending-report-time-filter-ist.md".
+PARSE_IST_TIMESTAMP_JS = """
+                function parseTs(s){
+                    var m = s.match(/(\\d{2})\\/(\\d{2})\\/(\\d{4})\\s+(\\d{1,2}):(\\d{2})\\s*(AM|PM)/i);
+                    if (!m) return 0;
+                    var d=+m[1], mo=+m[2], y=+m[3], hh=+m[4], mm=+m[5], ap=m[6].toUpperCase();
+                    if (ap==='PM' && hh<12) hh+=12;
+                    if (ap==='AM' && hh===12) hh=0;
+                    return Date.UTC(y, mo-1, d, hh, mm, 0) - 330 * 60000;   // IST = UTC+05:30
+                }
+"""
+
+
 # ── Report date (2026-10-13) ─────────────────────────────────
 # Same daterangepicker call that the Order Enquiry export has used since 10-Oct, so a
 # report can be exported for ANY past day (catch-up / back-fill), not only "Yesterday".

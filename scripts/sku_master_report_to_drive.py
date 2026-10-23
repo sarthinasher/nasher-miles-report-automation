@@ -40,7 +40,7 @@ from common.drive_utils import (
 from common.report_dates import should_retry, weekly_file_present
 from common.report_dates import drive_filename as drive_filename_for
 from common.vinculum_ui import (
-    LoginError, dismiss_top_modals, launch_browser, request_dialog_export,
+    PARSE_IST_TIMESTAMP_JS, LoginError, dismiss_top_modals, launch_browser, request_dialog_export,
     save_debug_screenshot, select_all_export_fields, vinculum_login,
 )
 
@@ -469,14 +469,7 @@ def _run_steps(page, drive_service, run_day):
     def get_latest_report(run_start_epoch_ms):
         raw = pctx.run_js(f"""
             try {{
-                function parseTs(s){{
-                    var m = s.match(/(\\d{{2}})\\/(\\d{{2}})\\/(\\d{{4}})\\s+(\\d{{1,2}}):(\\d{{2}})\\s*(AM|PM)/i);
-                    if (!m) return 0;
-                    var d=+m[1], mo=+m[2], y=+m[3], hh=+m[4], mm=+m[5], ap=m[6].toUpperCase();
-                    if (ap==='PM' && hh<12) hh+=12;
-                    if (ap==='AM' && hh===12) hh=0;
-                    return new Date(y, mo-1, d, hh, mm, 0).getTime();
-                }}
+                {PARSE_IST_TIMESTAMP_JS}
                 var rows = document.querySelectorAll('tr[role="row"]');
                 var latest = null;
                 for (var row of rows) {{
