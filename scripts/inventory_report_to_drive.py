@@ -30,7 +30,10 @@ from zoneinfo import ZoneInfo
 from DrissionPage import ChromiumPage, ChromiumOptions
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from common.drive_utils import get_drive_service, upload_to_drive, get_latest_downloaded_file
+from common.drive_utils import (
+    get_drive_service, upload_to_drive, get_latest_downloaded_file, list_file_names,
+)
+from common.report_dates import inventory_file_today
 from common.report_merge import dry_run, keep_dry_run_copy, merge_for_upload, remove_files
 from common.vinculum_ui import (
     location_spec,
@@ -85,6 +88,20 @@ def main():
     print("\n[0] Authenticating Google Drive API (service account)...")
     drive_service = get_drive_service()
     print("    [OK] Drive API ready!")
+
+    # Catch-up run (2026-10-23): the evening cron sets INVENTORY_ONLY_IF_MISSING and
+    # exports only when today's (IST) file is missing - the morning run failed or was
+    # cancelled in the vinculum-session queue (20/21-Oct). A missed snapshot cannot be
+    # back-filled later, so this is the only second chance.
+    if (os.environ.get("INVENTORY_ONLY_IF_MISSING") or "").strip().lower() == "true":
+        today = datetime.now(IST).date()
+        existing = list_file_names(drive_service, GDRIVE_FOLDER_ID, None)
+        have = inventory_file_today(today, existing)
+        if have:
+            print(f"\n[✓] Nothing to do - today's inventory is already in Drive: {have}")
+            return
+        print(f"\n    Catch-up: no inventory file for {today:%d-%m-%Y} in Drive"
+              + (" (folder could not be listed)" if existing is None else "") + " - exporting.")
 
     print("\n[1] Launching headless browser...")
     co = ChromiumOptions()

@@ -118,3 +118,15 @@ def test_requested_backfill_reexports_unless_skip_existing():
 def test_requested_today_is_rejected():
     with pytest.raises(ReportDateError):
         dates_to_export("13/10/2026", DAY13, set(), SALES_REPORT_NAME)
+
+
+# ── inventory_file_today: the evening Inventory catch-up (2026-10-23) ──
+def test_inventory_file_today():
+    from common.report_dates import inventory_file_today
+    today = date(2026, 10, 23)
+    names = {"22-10-2026_16-02", "23-10-2026_15-36", "23-10-2026_09-10", "SKU Master 23-10-2026"}
+    assert inventory_file_today(today, names) == "23-10-2026_15-36"
+    assert inventory_file_today(date(2026, 10, 24), names) is None
+    assert inventory_file_today(date(2026, 11, 1), {"31-10-2026_23-50"}) is None   # month end
+    assert inventory_file_today(today, set()) is None
+    assert inventory_file_today(today, None) is None        # Drive not listable -> export

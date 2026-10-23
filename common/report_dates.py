@@ -149,3 +149,12 @@ def weekly_file_present(today, existing_names, prefix):
     start = week_start(today)
     return any(drive_filename(start + timedelta(days=i), prefix) in existing_names
                for i in range((today - start).days + 1))
+
+
+def inventory_file_today(today, existing_names):
+    """Name of an Inventory file taken today (IST), else None. Inventory files are named
+    DD-MM-YYYY_HH-MM (run time, IST). existing_names None (Drive not listable) -> None,
+    so the caller exports rather than skips (2026-10-23 catch-up run)."""
+    prefix = today.strftime("%d-%m-%Y_")
+    found = sorted(n for n in (existing_names or ()) if n.startswith(prefix))
+    return found[-1] if found else None

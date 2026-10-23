@@ -1,0 +1,23 @@
+# No inventory file for 19, 20 and 21-Oct: Inventory's only daily run failed or was cancelled in the queue
+
+- **Date:** 2026-10-23
+- **Reported as:** "something is broken" (23-Oct review request). Runs: Inventory 39232695476 (19-Oct) `failure`, 39399952206 (20-Oct) `cancelled`, 39575746051 (21-Oct) `cancelled`.
+- **Symptom:** no Inventory run produced a `DD-MM-YYYY_HH-MM` file for 19/10, 20/10 or 21/10/2026 (no manual Inventory run either; Drive itself not checked) (the next ones are `22-10-2026_16-02` from 39761427312 and `23-10-2026_15-36` from 39936624412).
+  - 39232695476: `[✗] Vinculum login failed for user '***': no message shown, still on the login page ...`
+  - 39399952206: created 09:20:27Z, never started, cancelled 09:33:45Z - the moment Order Enquiry 39401574151 was queued (09:33:44Z) while Sales 39396241597 held `vinculum-session` (09:01-14:52, timed out at 350 min).
+  - 39575746051: created 09:17:03Z, cancelled 09:29:35Z when Order Enquiry 39577367558 was queued (09:29:33Z) behind Sales 39572252190 (08:50-11:04).
+- **Where:** `.github/workflows/inventory-report.yml` (`schedule`: one cron), `scripts/inventory_report_to_drive.py main()` (no retry, no skip-if-present).
+- **Root cause:** GitHub keeps only ONE waiting run per concurrency group and cancels the older waiting one when another is queued; Inventory had a single daily cron and no catch-up, and an inventory snapshot cannot be taken for a past day, so any failure or cancellation of that one run lost the day. (Pick Pack, Sales and Order Enquiry have a second cron plus a 7-day catch-up window, so their cancelled runs healed themselves.)
+- **Why it wasn't caught:** the 21-Oct move of the cron (04:09 -> 05:15) stopped this particular overlap but left Inventory with no second chance; `cancelled` runs do not alert.
+- **Fix:** a second cron `45 10 * * *` (70 min after the last daily Vinculum cron, Order Enquiry 09:35, so it normally queues behind nothing) that sets `INVENTORY_ONLY_IF_MISSING=true` (`github.event.schedule == '45 10 * * *'`). With it, `main()` lists the Drive folder and exits before launching a browser if a file dated today (IST) exists (`common/report_dates.inventory_file_today`); if none exists, or Drive cannot be listed, it exports as usual. The 05:15 run and manual runs are unchanged (always export). With GitHub's current ~5 h delay it lands ~15:45 UTC = 21:15 IST, still the same IST day (a later landing past midnight IST would only make it export for the new day, which the next morning's run does anyway).
+- **Evidence:**
+  - Run history above (`gh run list -L 60`, `gh run view <id> --json jobs`).
+  - `python -m pytest tests/test_inventory_catch_up.py tests/test_report_dates.py -q` -> catch-up skips when today's file exists (no browser launched), exports when it is missing or Drive is not listable, morning/manual runs never check Drive; `inventory_file_today` across a month end.
+  - Full suite in the commit's test run (`python -m pytest tests -q`).
+  - Workflow YAML parsed: `[{'cron': '15 5 * * *'}, {'cron': '45 10 * * *'}]`, env `INVENTORY_ONLY_IF_MISSING: ${{ github.event.schedule == '45 10 * * *' }}`. NOT run (a run logs in to Vinculum).
+- **Blast radius:** one more queued run per day in `vinculum-session`. It can itself cancel a run that is WAITING at ~15:45 UTC - only an Order Enquiry / Sales second run stuck behind a long one, and those catch up the next morning. On a normal day it holds the group for well under a minute (Drive listing only).
+- **Still open:**
+  - 19/10, 20/10 and 21/10 inventory cannot be recovered.
+  - Inventory still has no in-run retry: one failed location fails the whole run (the catch-up retries the day).
+  - The other cron times were checked against the measured run times and left alone (see the 23-Oct review).
+- **Related:** 2026-10-23-sales-17-location-loop-timeouts.md (the long Sales runs that held the group), 2026-10-23-inventory-first-location-stale-report.md, 2026-10-19-new-vinculum-login-exports-only-nm4.md.

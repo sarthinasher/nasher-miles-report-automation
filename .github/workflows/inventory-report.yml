@@ -6,6 +6,13 @@ on:
     # land while Sales (03:40) / Order Enquiry (04:35) hold the vinculum-session group -
     # GitHub keeps one waiting run per group and cancels the older one (2026-10-21).
     - cron: "15 5 * * *"
+    # Catch-up (2026-10-23): exports ONLY if no inventory file dated today (IST) is in
+    # Drive - the 05:15 run failed or was cancelled in the queue (20/21-Oct were lost:
+    # a snapshot cannot be back-filled). 70 min after the last daily Vinculum cron (Order
+    # Enquiry 09:35), so it normally queues behind nothing. GitHub has been starting this
+    # repo's crons ~5 h late (05:15 -> ~10:10 UTC): this one lands ~15:45 UTC = 21:15 IST,
+    # still the same IST day. Normally it lists Drive and exits without a Vinculum login.
+    - cron: "45 10 * * *"
   workflow_dispatch:
     inputs:
       locations:
@@ -48,4 +55,6 @@ jobs:
           VIN_PASSWORD: ${{ secrets.VIN_PASSWORD }}
           GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
           VIN_LOCATIONS: ${{ inputs.locations || vars.VIN_LOCATIONS }}
+          INVENTORY_ONLY_IF_MISSING: ${{ github.event.schedule == '45 10 * * *' }}
+          PYTHONUNBUFFERED: "1"
         run: python scripts/inventory_report_to_drive.py
