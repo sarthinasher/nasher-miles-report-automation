@@ -10,11 +10,17 @@ Sheet named DD.MM.YYYY (the REPORT = invoice date) -> deletes the local temp cop
 Read by the Apps Script Sales Master consolidation and (since 2026-10-13) directly by
 the GT Full Flow FMS.
 
-Which locations (2026-10-19): Vinculum exports only the session's location, so the
-report is exported once per location the login can switch to (VIN_LOCATIONS: blank /
-all = every one; "A03,NM4"; "all,-S01") and the files are merged into the one Drive
-file (common/vinculum_ui.export_all_locations, common/report_merge.py). VIN_DRY_RUN=true
-= export + merge without uploading.
+Which location (2026-10-23): the Sales Report is company-wide - every location returns
+the same rows (13/10/2026: 827 from each of the 17) - so it is exported ONCE, from
+SALES_LOCATION (common/vinculum_ui.single_location_choice):
+  blank / unset -> A02 (DEFAULT_SALES_LOCATION)   "NM4" (any code) -> that location
+  "DEFAULT"     -> no switch: the location the login lands on (NM4 today)
+  "ALL"         -> the 2026-10-19 loop: once per location in VIN_LOCATIONS (blank / all =
+                   every one; "A03,NM4"; "all,-S01"), merged into the one Drive file
+                   (common/vinculum_ui.export_all_locations, common/report_merge.py).
+The 17-location loop took 35-70 min per date and hit the 350-min timeout (record
+"Errors and their fixes/2026-10-23-sales-17-location-loop-timeouts.md").
+VIN_DRY_RUN=true = export (+ merge) without uploading.
 
 Which dates (2026-10-13, common/daily_export.py): REPORT_DATE blank -> every day of
 the last 7 (ending yesterday, IST) whose file is missing in Drive (normally just
@@ -44,7 +50,7 @@ from common import daily_export
 from common.report_dates import SALES_REPORT_NAME, drive_filename, vinculum_date
 from common.report_merge import dry_run, keep_dry_run_copy, merge_for_upload, remove_files
 from common.vinculum_ui import (
-    location_spec,
+    location_spec, export_one_location, single_location_choice,
     SESSION_LOST_HINT, check_site_location, dismiss_top_modals, export_all_locations,
     is_no_data_message, read_page_message, save_debug_screenshot, session_lost, set_report_date,
     vinculum_login,
@@ -65,8 +71,12 @@ GDRIVE_FOLDER_ID = os.environ.get(
 )
 
 BASE = "https://nashermiles.vineretail.com/eRetailWeb"
-# Locations exported when VIN_LOCATIONS is not set: all of them - the stores (S01-S03)
-# may invoice POS sales; no per-location Sales counts exist yet (2026-10-21).
+# SALES_LOCATION blank: the one location the Sales Report is exported from (2026-10-23).
+# Every location returns the full company-wide report (run 39716075711: 13/10 = 827 rows
+# from each of the 17, 15/10 = 734, 16/10 = 607, ...); A02 is explicit, so the export does
+# not depend on which location the login lands on.
+DEFAULT_SALES_LOCATION = "A02"
+# SALES_LOCATION=ALL only: locations looped when VIN_LOCATIONS is not set.
 DEFAULT_LOCATIONS = "all"
 
 
@@ -261,16 +271,26 @@ def _export_steps(page, drive_service, day):
     vinculum_login(page, BASE, LOGIN_ID, PASSWORD, ORG_ID)
     dismiss_top_modals(page, "after login")
 
-    # ── STEPS 3-8 PER LOCATION, THEN MERGE (2026-10-19) ──
-    # Vinculum exports only the session's location: export every location the user
-    # can switch to (VIN_LOCATIONS) and merge them into the one DD.MM.YYYY file.
-    print("\n[3] Locations...")
+    # ── STEPS 3-8 FOR ONE LOCATION (2026-10-23) ─────────
+    # The Sales Report is company-wide: export it once, from SALES_LOCATION (A02).
+    # SALES_LOCATION=ALL keeps the 2026-10-19 loop over every location + merge.
+    print("\n[3] Location...")
     drive_name = drive_filename(day, *SALES_REPORT_NAME)
+    mode, sales_loc = single_location_choice(os.environ.get("SALES_LOCATION"),
+                                             DEFAULT_SALES_LOCATION)
+    print(f"    SALES_LOCATION={os.environ.get('SALES_LOCATION') or '(blank)'} -> "
+          + {"single": f"export from {sales_loc} only",
+             "session": "export from the session's own location only (no switch)",
+             "all": "export every location and merge (VIN_LOCATIONS)"}[mode])
+    done = _location_files.setdefault(day, {})
     parts, local_file = [], None
     try:
-        parts = export_all_locations(page, BASE, lambda loc: _export_location(page, day, loc),
-                                     done=_location_files.setdefault(day, {}),
-                                     spec=location_spec(DEFAULT_LOCATIONS))
+        if mode == "all":
+            parts = export_all_locations(page, BASE, lambda loc: _export_location(page, day, loc),
+                                         done=done, spec=location_spec(DEFAULT_LOCATIONS))
+        else:
+            parts = export_one_location(page, BASE, lambda loc: _export_location(page, day, loc),
+                                        loc=sales_loc, done=done)
         local_file, _total = merge_for_upload(parts, LOCAL_DOWNLOAD_PATH, drive_name)
         if not local_file:
             fail(f"No location returned a Sales Report file for {vinculum_date(day)}.")
@@ -449,6 +469,11 @@ def _export_location(page, day, loc):
 
 def main():
     validate_env()
+    try:   # a bad SALES_LOCATION fails here, before any Vinculum login
+        single_location_choice(os.environ.get("SALES_LOCATION"), DEFAULT_SALES_LOCATION)
+    except Exception as e:
+        print(f"\n[✗] SALES_LOCATION: {e}")
+        sys.exit(2)
     os.makedirs(LOCAL_DOWNLOAD_PATH, exist_ok=True)
     daily_export.main("MIS Sales Report", SALES_REPORT_NAME, GDRIVE_FOLDER_ID, export_day,
                       get_drive_service, list_file_names)

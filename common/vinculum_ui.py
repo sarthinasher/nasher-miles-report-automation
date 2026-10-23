@@ -779,6 +779,79 @@ def session_lost(page):
         return False
 
 
+def _log_location_rows(loc, path):
+    from common.report_merge import count_rows, read_rows
+    if not path:
+        print(f"    {loc}: no data (nothing exported)")
+        return
+    try:
+        print(f"    {loc}: {count_rows(read_rows(path)[1])} data row(s) in {os.path.basename(path)}")
+    except Exception as e:
+        print(f"    {loc}: could not count rows ({e!r})")
+
+
+# 2026-10-23: one location instead of the loop, for reports that are company-wide.
+# The MIS Sales Report returns the SAME rows from every location (13/10/2026: 827 rows
+# from each of the 17, NM4 = the session's own location included), so looping 17
+# locations only multiplied the run time (35-70 min per date) and hit the timeout.
+SINGLE_LOCATION_SESSION = ("DEFAULT", "SESSION")
+SINGLE_LOCATION_ALL = ("ALL", "*")
+_LOCATION_CODE_RX = re.compile(r"^[A-Z0-9]{2,8}$")
+
+
+def single_location_choice(raw, default):
+    """Parses a one-location setting (e.g. SALES_LOCATION). Returns (mode, code):
+      blank / unset        -> ("single", default)
+      "A02" (any code)     -> ("single", "A02")   switch to it (if not already there)
+      "DEFAULT"/"SESSION"  -> ("session", "")     no switch: the location the login lands on
+      "ALL" / "*"          -> ("all", "")         the old loop over every VIN_LOCATIONS location
+    Raises LocationError for anything else (a list, a typo with spaces...)."""
+    value = (raw or "").strip().upper()
+    if not value:
+        value = (default or "").strip().upper()
+    if value in SINGLE_LOCATION_ALL:
+        return "all", ""
+    if value in SINGLE_LOCATION_SESSION or not value:
+        return "session", ""
+    if not _LOCATION_CODE_RX.match(value):
+        raise LocationError(f"Location setting {raw!r} is not one location code (e.g. A02), "
+                            f"DEFAULT (no switch) or ALL (export every location and merge).")
+    return "single", value
+
+
+def export_one_location(page, base, export_one, loc="", done=None):
+    """Runs export_one(loc) -> local file (or None = no data) for ONE location: loc
+    (switching to it first when the session is elsewhere) or, when loc is blank, the
+    session's own location (no switch). Returns [(loc, file_or_None)] like
+    export_all_locations; done: as there (a retry reuses the earlier file). No switch
+    back: a switch is for this session only ("Do Nothing"), the next login lands on the
+    user's default location again."""
+    done = {} if done is None else done
+    info = read_locations(page, base)
+    avail = [c.strip().upper() for c, _ in info["options"]]
+    current = (info.get("current") or info.get("selected") or "").strip().upper()
+    print(f"    Session location after login: {current or '?'}")
+    if loc:
+        target = resolve_locations(avail, loc)[0]      # LocationError if not offered
+    else:
+        target = current
+        if not target:
+            raise LocationError("Could not read the session's location from the Switch "
+                                "Location page.")
+    how = ("the session's own location, no switch" if target == current
+           else f"switching from {current or '?'}")
+    print(f"    Exporting ONE location: {target} ({how})")
+    if target in done and (done[target] is None or os.path.exists(done[target])):
+        print(f"    Already exported by an earlier attempt: {target}")
+        return [(target, done[target])]
+    if target != current:
+        switch_location(page, base, target)
+    path = export_one(target)
+    _log_location_rows(target, path)
+    done[target] = path
+    return [(target, path)]
+
+
 def export_all_locations(page, base, export_one, spec=None, done=None):
     """Runs export_one(loc) -> local file (or None = no data at loc) for every
     location VIN_LOCATIONS selects, switching the session location in between.
@@ -787,7 +860,6 @@ def export_all_locations(page, base, export_one, spec=None, done=None):
     done: a dict kept by the caller across attempts for the SAME report date:
     locations already exported by an earlier attempt are not exported again.
     Any failure (switch or export) raises: a partial merge is never uploaded."""
-    from common.report_merge import count_rows, read_rows
     done = {} if done is None else done
     locs, original = plan_locations(page, base, spec)
     todo = [x for x in locs if not (x in done and (done[x] is None or os.path.exists(done[x])))]
@@ -804,10 +876,7 @@ def export_all_locations(page, base, export_one, spec=None, done=None):
                 current = loc
             path = export_one(loc)
             if path:
-                try:
-                    print(f"    {loc}: {count_rows(read_rows(path)[1])} data row(s) in {os.path.basename(path)}")
-                except Exception as e:
-                    print(f"    {loc}: could not count rows ({e!r})")
+                _log_location_rows(loc, path)
             done[loc] = path
     finally:
         if original and current != original and not session_lost(page):

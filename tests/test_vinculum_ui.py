@@ -196,3 +196,80 @@ def test_location_spec_env_overrides_the_script_default(monkeypatch):
     assert location_spec("all") == "all"
     monkeypatch.setenv("VIN_LOCATIONS", "all")
     assert location_spec(LOCATIONS_WITH_ORDERS) == "all"
+
+
+# ── single_location_choice / export_one_location: Sales exports ONE location (2026-10-23) ──
+def test_single_location_choice_values():
+    from common.vinculum_ui import single_location_choice
+    assert single_location_choice(None, "A02") == ("single", "A02")      # unset -> default
+    assert single_location_choice("  ", "A02") == ("single", "A02")      # blank -> default
+    assert single_location_choice("nm4", "A02") == ("single", "NM4")
+    assert single_location_choice("DEFAULT", "A02") == ("session", "")
+    assert single_location_choice("session", "A02") == ("session", "")
+    assert single_location_choice("ALL", "A02") == ("all", "")
+    assert single_location_choice("*", "A02") == ("all", "")
+    assert single_location_choice("", "") == ("session", "")
+
+
+def test_single_location_choice_rejects_lists_and_junk():
+    from common.vinculum_ui import LocationError, single_location_choice
+    for bad in ("A02,NM4", "all,-S01", "A 02", "-S01"):
+        with pytest.raises(LocationError):
+            single_location_choice(bad, "A02")
+
+
+def _fake_switch_page(monkeypatch, codes, session):
+    import common.vinculum_ui as v
+    switches = []
+    monkeypatch.setattr(v, "read_locations", lambda page, base: {
+        "current": session, "options": [[c, c + " name"] for c in codes]})
+    monkeypatch.setattr(v, "switch_location", lambda page, base, loc, tries=2: switches.append(loc))
+    return v, switches
+
+
+def test_one_location_switches_once_and_never_loops(monkeypatch, tmp_path):
+    v, switches = _fake_switch_page(monkeypatch, ["A02", "A03", "NM4", "S01"], "NM4")
+    exported = []
+
+    def export_one(loc):
+        exported.append(loc)
+        p = tmp_path / f"{loc}.csv"
+        p.write_text("Order No,Originating warehouse\r\nX1,A02\r\nX2,NM7\r\n")
+        return str(p)
+
+    parts = v.export_one_location(None, "base", export_one, loc="A02")
+    assert exported == ["A02"]
+    assert switches == ["A02"]                        # one switch, no switch back
+    assert [loc for loc, _ in parts] == ["A02"]
+
+
+def test_one_location_default_uses_the_session_location_without_switching(monkeypatch):
+    v, switches = _fake_switch_page(monkeypatch, ["A02", "NM4"], "NM4")
+    exported = []
+    parts = v.export_one_location(None, "base", lambda loc: exported.append(loc) or None, loc="")
+    assert exported == ["NM4"] and switches == []
+    assert parts == [("NM4", None)]
+
+
+def test_one_location_already_the_session_location_does_not_switch(monkeypatch):
+    v, switches = _fake_switch_page(monkeypatch, ["A02", "NM4"], "A02")
+    v.export_one_location(None, "base", lambda loc: None, loc="a02")
+    assert switches == []
+
+
+def test_one_location_the_user_cannot_switch_to_is_an_error(monkeypatch):
+    v, switches = _fake_switch_page(monkeypatch, ["A03", "NM4"], "NM4")
+    with pytest.raises(v.LocationError):
+        v.export_one_location(None, "base", lambda loc: None, loc="A02")
+    assert switches == []
+
+
+def test_one_location_retry_reuses_the_earlier_file(monkeypatch, tmp_path):
+    v, switches = _fake_switch_page(monkeypatch, ["A02", "NM4"], "NM4")
+    f = tmp_path / "A02.xlsx"
+    f.write_text("x")
+    exported = []
+    parts = v.export_one_location(None, "base", lambda loc: exported.append(loc),
+                                  loc="A02", done={"A02": str(f)})
+    assert exported == [] and switches == []
+    assert parts == [("A02", str(f))]
