@@ -191,7 +191,7 @@ def test_a_failed_location_raises_and_keeps_what_was_done(monkeypatch, tmp_path)
 def test_location_spec_env_overrides_the_script_default(monkeypatch):
     from common.vinculum_ui import LOCATIONS_WITH_ORDERS, location_spec
     monkeypatch.delenv("VIN_LOCATIONS", raising=False)
-    assert location_spec(LOCATIONS_WITH_ORDERS) == "A03,GJ1,NM1,NM4,NM7,NM9"
+    assert location_spec(LOCATIONS_WITH_ORDERS) == LOCATIONS_WITH_ORDERS
     monkeypatch.setenv("VIN_LOCATIONS", "  ")
     assert location_spec("all") == "all"
     monkeypatch.setenv("VIN_LOCATIONS", "all")
@@ -273,3 +273,30 @@ def test_one_location_retry_reuses_the_earlier_file(monkeypatch, tmp_path):
                                   loc="A02", done={"A02": str(f)})
     assert exported == [] and switches == []
     assert parts == [("A02", str(f))]
+
+
+# ── Pick Pack / Order Enquiry default: GT warehouses (2026-10-23) ──
+# The 17 locations the current login can switch to (run 39797252301, 22-Oct).
+USER_17 = ["A02", "A03", "A07", "GJ1", "NM0", "NM2", "NM1", "NM4", "S02", "NM3", "S01", "NM6",
+           "S03", "NM8", "NM7", "NM9", "W03"]
+
+
+def test_default_covers_the_gt_warehouses_this_login_can_reach():
+    from common.vinculum_ui import LOCATIONS_WITH_ORDERS
+    assert resolve_locations(USER_17, LOCATIONS_WITH_ORDERS) == [
+        "A03", "GJ1", "NM1", "NM4", "NM7", "NM9", "NM8"]
+
+
+def test_default_picks_up_n10_and_a06_once_the_user_is_mapped_to_them():
+    from common.vinculum_ui import LOCATIONS_WITH_ORDERS
+    assert resolve_locations(USER_17 + ["N10", "A06"], LOCATIONS_WITH_ORDERS) == [
+        "A03", "GJ1", "NM1", "NM4", "NM7", "NM9", "NM8", "N10", "A06"]
+
+
+def test_optional_location_missing_is_a_warning_not_an_error(capsys):
+    assert resolve_locations(AVAIL, "NM4,?N10") == ["NM4"]
+    assert "N10" in capsys.readouterr().out
+    with pytest.raises(LocationError):              # a plain unknown code is still an error
+        resolve_locations(AVAIL, "NM4,N10")
+    with pytest.raises(LocationError):              # nothing left at all
+        resolve_locations(AVAIL, "?N10")

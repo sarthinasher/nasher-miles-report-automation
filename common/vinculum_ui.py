@@ -596,22 +596,29 @@ def resolve_locations(available, spec):
       "" / "all" / "*"   -> every available location
       "A03, nm4"         -> exactly those (case-insensitive)
       "all,-S01,-S02"    -> all but S01 / S02
+      "NM4,?N10"         -> NM4, plus N10 if the user can switch to it (else a warning)
     Raises LocationError for a code the user cannot switch to (never silently
-    skipped) or when nothing is left."""
+    skipped, except a "?" optional one) or when nothing is left."""
     avail = [a.strip().upper() for a in available if a and a.strip()]
     tokens = [t.strip().upper() for t in (spec or "").replace(";", ",").split(",") if t.strip()]
-    include = [t for t in tokens if not t.startswith("-")]
+    optional = {t[1:].strip() for t in tokens if t.startswith("?")}
+    include = [t[1:].strip() if t.startswith("?") else t for t in tokens if not t.startswith("-")]
     exclude = {t[1:].strip() for t in tokens if t.startswith("-")}
     if not include or any(t in ("ALL", "*") for t in include):
         chosen = list(avail)
     else:
-        unknown = [t for t in include if t not in avail]
+        unknown = [t for t in include if t not in avail and t not in optional]
         if unknown:
             raise LocationError(f"VIN_LOCATIONS asks for {', '.join(unknown)}, but this Vinculum "
                                 f"user can only switch to: {', '.join(avail) or '(none)'}")
+        missing = [t for t in include if t not in avail]
+        if missing:
+            print(f"    [!] NOT exported - this Vinculum user cannot switch to "
+                  f"{', '.join(missing)}: their orders are missing from the file until the "
+                  f"admin maps the user to these locations.")
         chosen = []
         for t in include:
-            if t not in chosen:
+            if t in avail and t not in chosen:
                 chosen.append(t)
     unknown_ex = sorted(t for t in exclude if t not in avail)
     if unknown_ex:
@@ -643,7 +650,12 @@ def read_locations(page, base):
 # 17-location runs of 19/20-Oct (11-20 Oct data): every other location was 0 on every
 # date. Pick Pack and Order Enquiry default to these (6 exports instead of 17 per date,
 # so the jobs finish before the next one is due); VIN_LOCATIONS overrides ("all" = 17).
-LOCATIONS_WITH_ORDERS = "A03,GJ1,NM1,NM4,NM7,NM9"
+# 2026-10-23: + NM8 (Hyderabad, a GT route in the punch portal; 0 rows on 11-20/10 but
+# switchable, ~1 min per date) and the GT warehouses N10 and A06 as OPTIONAL ("?"): this
+# login cannot switch to them today (its 17 locations have no N10 / A06 / AL* / HO), so
+# their orders (e.g. N012271) are in no Order Enquiry / Pick Pack file. The run warns
+# about them on every date and exports them as soon as the admin maps the user to them.
+LOCATIONS_WITH_ORDERS = "A03,GJ1,NM1,NM4,NM7,NM9,NM8,?N10,?A06"
 
 
 def location_spec(default=""):

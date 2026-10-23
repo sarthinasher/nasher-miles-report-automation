@@ -11,9 +11,10 @@ on:
       locations:
         description: >-
           Vinculum locations to export and merge: blank = the repo variable
-          VIN_LOCATIONS, else the script's default (Pick Pack / Order Enquiry: the 6 with
-          orders, A03,GJ1,NM1,NM4,NM7,NM9; Inventory: all; Sales: one location). "all" = all 17;
-          "A03,NM4" = only those; "all,-S01,-S02" = all but those.
+          VIN_LOCATIONS, else the script's default (Pick Pack / Order Enquiry: the GT
+          warehouses A03,GJ1,NM1,NM4,NM7,NM9,NM8 + N10,A06 once the login can switch to
+          them; Inventory: all; Sales: one location). "all" = all 17; "A03,NM4" = only
+          those; "all,-S01,-S02" = all but those; "?N10" = N10 if available.
         required: false
         default: ""
 
