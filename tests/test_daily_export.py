@@ -170,19 +170,7 @@ def test_date_range_js_and_check():
 
 
 # ── SharePoint sync picks the file by name (2026-10-13) ─────────
-def test_sync_dates_default_yesterday_and_backfill(monkeypatch):
-    import importlib.util
-    import types
-    for mod in ("requests",):
-        sys.modules.setdefault(mod, types.ModuleType(mod))
-    path = os.path.join(os.path.dirname(__file__), "..", "scripts", "sync_sales_to_sharepoint.py")
-    spec = importlib.util.spec_from_file_location("sync_sales", path)
-    m = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(m)
-    assert m.sync_dates(date(2026, 10, 13), "") == [D12]
-    assert m.sync_dates(date(2026, 10, 13), "11/10/2026-12/10/2026") == [D11, D12]
-
-
+# The sync's date selection (catch-up since 2026-10-23) is tested in tests/test_sharepoint_sync.py.
 def test_find_drive_file_by_name_queries_exact_name():
     from common.drive_utils import find_drive_file_by_name
     seen = {}

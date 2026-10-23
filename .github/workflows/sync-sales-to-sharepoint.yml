@@ -2,22 +2,29 @@ name: Sync Sales to SharePoint
 
 on:
   schedule:
-    # Mirrors yesterday's (IST) Sales file BY NAME (2026-10-13). The second run picks it
-    # up if the Sales export (incl. its 08:40 UTC catch-up) landed after the first.
+    # Mirrors the Sales files BY NAME (2026-10-13). Blank report_date = catch-up of the
+    # last 7 days ending yesterday (2026-10-23): days missing on SharePoint, or re-exported
+    # in Drive since, so a day whose export landed late is picked up by a later run.
     - cron: "5 4 * * *"
     - cron: "5 9 * * *"
   workflow_dispatch:
     inputs:
       report_date:
         description: >-
-          Invoice date(s) to mirror, DD/MM/YYYY (one, a list or a range). Blank = yesterday.
+          Invoice date(s) to mirror, DD/MM/YYYY (one, a list or a range); always
+          re-uploaded. Blank = catch-up of the last 7 days (missing / re-exported ones).
         required: false
         default: ""
+
+# Two syncs never write the same files at once (a manual run waits for a scheduled one).
+concurrency:
+  group: sync-sales-to-sharepoint
+  cancel-in-progress: false
 
 jobs:
   sync-sales-to-sharepoint:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
 
     steps:
       - name: Checkout repo
@@ -38,4 +45,5 @@ jobs:
           SP_TENANT_ID: ${{ secrets.SP_TENANT_ID }}
           SP_CLIENT_SECRET: ${{ secrets.SP_CLIENT_SECRET }}
           REPORT_DATE: ${{ inputs.report_date }}
+          PYTHONUNBUFFERED: "1"
         run: python scripts/sync_sales_to_sharepoint.py
