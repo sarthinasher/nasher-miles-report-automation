@@ -264,3 +264,14 @@ def remove_files(paths):
             os.remove(p)
         except OSError:
             pass
+
+
+def remove_attempt_files(parts, merged, keep_parts=False):
+    """End of one export attempt: deletes the merged file and the per-location files.
+    keep_parts=True (only after a failed Drive UPLOAD, 2026-10-23): the per-location
+    files stay on disk, so the retry reuses them (export_all_locations / export_one_location
+    done=...) instead of exporting every location again. After any other failure they
+    are deleted as before, so a bad export is never reused."""
+    part_paths = [p for _, p in parts if p]
+    remove_files(([] if keep_parts else part_paths)
+                 + ([merged] if merged and merged not in part_paths else []))

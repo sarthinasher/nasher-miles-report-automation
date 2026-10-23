@@ -48,7 +48,7 @@ from common.drive_utils import (
 )
 from common import daily_export
 from common.report_dates import SALES_REPORT_NAME, drive_filename, vinculum_date
-from common.report_merge import dry_run, keep_dry_run_copy, merge_for_upload, remove_files
+from common.report_merge import dry_run, keep_dry_run_copy, merge_for_upload, remove_attempt_files
 from common.vinculum_ui import (
     location_spec, export_one_location, single_location_choice,
     SESSION_LOST_HINT, check_site_location, dismiss_top_modals, export_all_locations,
@@ -283,7 +283,7 @@ def _export_steps(page, drive_service, day):
              "session": "export from the session's own location only (no switch)",
              "all": "export every location and merge (VIN_LOCATIONS)"}[mode])
     done = _location_files.setdefault(day, {})
-    parts, local_file = [], None
+    parts, local_file, upload_failed = [], None, False
     try:
         if mode == "all":
             parts = export_all_locations(page, BASE, lambda loc: _export_location(page, day, loc),
@@ -302,11 +302,12 @@ def _export_steps(page, drive_service, day):
         print("\n[9] Uploading to Google Drive...")
         uploaded_file_id = upload_to_drive(drive_service, local_file, drive_name, GDRIVE_FOLDER_ID)
         if not uploaded_file_id:
+            upload_failed = True        # the retry reuses the per-location files
             fail("Drive upload failed. Check that the folder is shared with the service account's client_email.")
         print(f"    Link: https://drive.google.com/file/d/{uploaded_file_id}/view")
         print(f"  [✓] {drive_name} uploaded to Google Drive as a Sheet.")
     finally:
-        remove_files([p for _, p in parts] + [local_file])
+        remove_attempt_files(parts, local_file, keep_parts=upload_failed)
 
 
 def _export_location(page, day, loc):

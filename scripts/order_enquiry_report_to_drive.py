@@ -49,7 +49,7 @@ from common.report_dates import (
 )
 from common.report_dates import drive_filename as drive_filename_for
 from common.report_merge import (
-    count_rows, dry_run, keep_dry_run_copy, merge_for_upload, read_rows, remove_files,
+    count_rows, dry_run, keep_dry_run_copy, merge_for_upload, read_rows, remove_attempt_files,
 )
 from common.vinculum_ui import (
     LOCATIONS_WITH_ORDERS, location_spec,
@@ -154,7 +154,7 @@ def _run_steps(page, drive_service, report_day):
     # can switch to (VIN_LOCATIONS) and merge them into the one OrderEnquiry_ file.
     print("\n[2b] Locations...")
     drive_filename = drive_filename_for(report_day)
-    parts, local_file = [], None
+    parts, local_file, upload_failed = [], None, False
     try:
         parts = export_all_locations(
             page, BASE, lambda loc: _export_location(page, report_day, loc, home_url),
@@ -172,10 +172,11 @@ def _run_steps(page, drive_service, report_day):
         print("\n[10] Uploading to Google Drive...")
         uploaded_file_id = upload_to_drive(drive_service, local_file, drive_filename, GDRIVE_FOLDER_ID)
         if not uploaded_file_id:
+            upload_failed = True        # the retry reuses the per-location files
             fail("Drive upload failed. Check that the folder is shared with the service account's client_email.")
         print(f"    Link: https://drive.google.com/file/d/{uploaded_file_id}/view")
     finally:
-        remove_files([p for _, p in parts] + [local_file])
+        remove_attempt_files(parts, local_file, keep_parts=upload_failed)
 
     print("\n" + "=" * 55)
     print("  [✓] SUCCESS! Order Enquiry report uploaded to Google Drive as a Sheet.")
