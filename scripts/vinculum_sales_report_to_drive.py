@@ -13,7 +13,7 @@ the GT Full Flow FMS.
 Which location (2026-10-23): the Sales Report is company-wide - every location returns
 the same rows (13/10/2026: 827 from each of the 17) - so it is exported ONCE, from
 SALES_LOCATION (common/vinculum_ui.single_location_choice):
-  blank / unset -> A02 (DEFAULT_SALES_LOCATION)   "NM4" (any code) -> that location
+  blank / unset -> H01 (DEFAULT_SALES_LOCATION; A02 until 23-Nov-2026)   "NM4" (any code) -> that location
   "DEFAULT"     -> no switch: the location the login lands on (NM4 today)
   "ALL"         -> the 2026-10-19 loop: once per location in VIN_LOCATIONS (blank / all =
                    every one; "A03,NM4"; "all,-S01"), merged into the one Drive file
@@ -75,7 +75,10 @@ BASE = "https://nashermiles.vineretail.com/eRetailWeb"
 # Every location returns the full company-wide report (run 39716075711: 13/10 = 827 rows
 # from each of the 17, 15/10 = 734, 16/10 = 607, ...); A02 is explicit, so the export does
 # not depend on which location the login lands on.
-DEFAULT_SALES_LOCATION = "A02"
+# 2026-11-23: A02 is one of the 8 locations whose switch blanks the session since 19-Nov (UNSWITCHABLE_LOCATIONS,
+# "Errors and their fixes/2026-11-23-vinculum-8-locations-unswitchable.md"), so every Sales run failed with
+# "VIN_LOCATIONS='A02' leaves no location to export". H01 is the login's own landing location (no switch) and switches fine.
+DEFAULT_SALES_LOCATION = "H01"
 # SALES_LOCATION=ALL only: locations looped when VIN_LOCATIONS is not set.
 DEFAULT_LOCATIONS = "all"
 
@@ -272,7 +275,7 @@ def _export_steps(page, drive_service, day):
     dismiss_top_modals(page, "after login")
 
     # ── STEPS 3-8 FOR ONE LOCATION (2026-10-23) ─────────
-    # The Sales Report is company-wide: export it once, from SALES_LOCATION (A02).
+    # The Sales Report is company-wide: export it once, from SALES_LOCATION (H01; A02 until 23-Nov-2026).
     # SALES_LOCATION=ALL keeps the 2026-10-19 loop over every location + merge.
     print("\n[3] Location...")
     drive_name = drive_filename(day, *SALES_REPORT_NAME)

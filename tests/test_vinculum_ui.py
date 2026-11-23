@@ -334,3 +334,16 @@ def test_optional_location_missing_is_a_warning_not_an_error(capsys):
         resolve_locations(AVAIL, "NM4,N10")
     with pytest.raises(LocationError):              # nothing left at all
         resolve_locations(AVAIL, "?N10")
+
+
+def test_sales_default_location_is_switchable():
+    # 2026-11-23: the Sales default must never be an unswitchable location (A02 was, and every Sales run failed).
+    import importlib.util, os, sys
+    os.environ.setdefault("VIN_LOGIN_ID", "x"); os.environ.setdefault("VIN_PASSWORD", "x")
+    os.environ.pop("VIN_UNSWITCHABLE", None)
+    path = os.path.join(os.path.dirname(__file__), "..", "scripts", "vinculum_sales_report_to_drive.py")
+    src = open(path, encoding="utf-8").read()
+    import re
+    default = re.search(r'^DEFAULT_SALES_LOCATION = "([A-Z0-9]+)"', src, re.M).group(1)
+    import common.vinculum_ui as v
+    assert default not in v.unswitchable_locations()

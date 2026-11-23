@@ -24,7 +24,7 @@ on:
         description: >-
           The ONE location the Sales Report is exported from (it is company-wide: every
           location returns the same rows). Blank = the repo variable SALES_LOCATION, else
-          A02. A code (A02, NM4, ...) = that location; DEFAULT = no switch (the location
+          H01 (A02 until 23-Nov-2026: unswitchable). A code (H01, NM4, ...) = that location; DEFAULT = no switch (the location
           the login lands on); ALL = the old loop over every location in "locations" +
           merge (slow: ~35 min per date for 17 locations).
         required: false

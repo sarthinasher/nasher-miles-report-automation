@@ -56,3 +56,9 @@
   - Pick Pack / Order Enquiry / Sales for 19–23 Nov: their 7-day catch-up should refill them on the next runs. Check after the first green run.
   - Branch `diag/location-switch` is diagnostic only; delete it.
 - **Related:** 2026-10-19-new-vinculum-login-exports-only-nm4.md, 2026-10-23-sales-17-location-loop-timeouts.md.
+
+## Follow-up 23-Nov: Vinculum Sales still failed after the skip fix
+- **Symptom:** run 45158602956, on every date: `SALES_LOCATION=(blank) -> export from A02 only`, then `[!] 19/11/2026 attempt 1/2 failed: VIN_LOCATIONS='A02' leaves no location to export (available: A03, A07, H01, …)`, then `[✗] 4 date(s) not exported`. Sync Sales to SharePoint failed after it (`[✗] 4 date(s) not synced`), because no Sales files existed.
+- **Root cause:** `scripts/vinculum_sales_report_to_drive.py` `DEFAULT_SALES_LOCATION = "A02"`. The Sales Report is company-wide (every location returns the same rows), so it is exported from ONE fixed location, and that location was A02, one of the 8 unswitchable ones. The skip fix correctly refused it, which left nothing to export.
+- **Fix:** default `H01`, the login's own landing location, which switches fine; the workflow input text is updated too. New test `test_sales_default_location_is_switchable`: the default must never be in `unswitchable_locations()`.
+- **Evidence:** `python -m pytest tests -q` gives 169 passed. Live re-run: see the commit / chat.
