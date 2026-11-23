@@ -17,9 +17,9 @@ on:
         options: [probe, dry_run]
         default: probe
       report:
-        description: "dry_run only: which report"
+        description: "dry_run only: which report (switchall = try a switch to every location, report OK / BROKEN; no export)"
         type: choice
-        options: [pickpack, sales, order_enquiry, inventory]
+        options: [pickpack, sales, order_enquiry, inventory, switchall]
         default: pickpack
       report_date:
         description: "dry_run only: DD/MM/YYYY (inventory ignores it)"
@@ -73,6 +73,7 @@ jobs:
           GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
           VIN_DRY_RUN: "true"
           VIN_LOCATIONS: ${{ inputs.locations }}
+          VIN_UNSWITCHABLE: ${{ vars.VIN_UNSWITCHABLE }}
           REPORT_DATE: ${{ inputs.report_date }}
           PICKPACK_DEBUG_DIR: /tmp/vinculum_probe
           SALES_DEBUG_DIR: /tmp/vinculum_probe
@@ -86,6 +87,7 @@ jobs:
             sales)         script=scripts/vinculum_sales_report_to_drive.py ;;
             order_enquiry) script=scripts/order_enquiry_report_to_drive.py ;;
             inventory)     script=scripts/inventory_report_to_drive.py ;;
+            switchall)     script=scripts/diag_switch_all.py ;;
             *) echo "unknown report $REPORT"; exit 2 ;;
           esac
           python "$script"

@@ -85,6 +85,7 @@ jobs:
           SKIP_EXISTING: ${{ inputs.skip_existing }}
           SALES_LOCATION: ${{ inputs.sales_location || vars.SALES_LOCATION }}
           VIN_LOCATIONS: ${{ inputs.locations || vars.VIN_LOCATIONS }}
+          VIN_UNSWITCHABLE: ${{ vars.VIN_UNSWITCHABLE }}
           PYTHONUNBUFFERED: "1"
         run: python scripts/vinculum_sales_report_to_drive.py
 

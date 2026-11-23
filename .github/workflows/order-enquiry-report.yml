@@ -69,6 +69,7 @@ jobs:
           REPORT_DATE: ${{ inputs.report_date }}
           SKIP_EXISTING: ${{ inputs.skip_existing }}
           VIN_LOCATIONS: ${{ inputs.locations || vars.VIN_LOCATIONS }}
+          VIN_UNSWITCHABLE: ${{ vars.VIN_UNSWITCHABLE }}
           PYTHONUNBUFFERED: "1"
         run: python scripts/order_enquiry_report_to_drive.py
 

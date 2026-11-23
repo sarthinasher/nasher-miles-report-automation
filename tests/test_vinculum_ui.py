@@ -88,6 +88,13 @@ from common.vinculum_ui import (  # noqa: E402
 AVAIL = ["A02", "A03", "GJ1", "NM4", "S01", "S02"]
 
 
+@pytest.fixture(autouse=True)
+def _no_unswitchable_skip(monkeypatch):
+    """The fake-Vinculum tests below use A02 / S02 as ordinary locations: switch the
+    2026-11-23 default skip list off unless a test sets VIN_UNSWITCHABLE itself."""
+    monkeypatch.setenv("VIN_UNSWITCHABLE", "none")
+
+
 def test_blank_or_all_means_every_location_the_user_can_switch_to():
     assert resolve_locations(AVAIL, "") == AVAIL
     assert resolve_locations(AVAIL, "all") == AVAIL
@@ -114,6 +121,33 @@ def test_nothing_left_is_an_error():
         resolve_locations(AVAIL, "A03,-A03")
     with pytest.raises(LocationError):
         resolve_locations([], "")
+
+
+def test_unswitchable_locations_are_skipped_with_a_warning_not_an_error(capsys):
+    # 2026-11-23: Vinculum still lists A02 / S02 but a switch to them blanks the session.
+    assert resolve_locations(AVAIL, "all", skip={"A02", "S02"}) == ["A03", "GJ1", "NM4", "S01"]
+    assert resolve_locations(AVAIL, "A03,S02,NM4", skip={"S02"}) == ["A03", "NM4"]
+    out = capsys.readouterr().out
+    assert "S02" in out and "NOT exported" in out
+
+
+def test_skip_codes_the_user_does_not_have_are_ignored():
+    assert resolve_locations(AVAIL, "all", skip={"NM8"}) == AVAIL
+
+
+def test_only_unswitchable_left_is_an_error():
+    with pytest.raises(LocationError):
+        resolve_locations(AVAIL, "S02", skip={"S02"})
+
+
+def test_unswitchable_default_and_env_override(monkeypatch):
+    import common.vinculum_ui as v
+    monkeypatch.delenv("VIN_UNSWITCHABLE", raising=False)
+    assert {"A02", "NM8", "W03"} <= v.unswitchable_locations()
+    monkeypatch.setenv("VIN_UNSWITCHABLE", "none")
+    assert v.unswitchable_locations() == set()
+    monkeypatch.setenv("VIN_UNSWITCHABLE", "a02, nm8")
+    assert v.unswitchable_locations() == {"A02", "NM8"}
 
 
 def test_parse_locations():

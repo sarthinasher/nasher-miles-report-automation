@@ -55,6 +55,7 @@ jobs:
           VIN_PASSWORD: ${{ secrets.VIN_PASSWORD }}
           GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
           VIN_LOCATIONS: ${{ inputs.locations || vars.VIN_LOCATIONS }}
+          VIN_UNSWITCHABLE: ${{ vars.VIN_UNSWITCHABLE }}
           INVENTORY_ONLY_IF_MISSING: ${{ github.event.schedule == '45 10 * * *' }}
           PYTHONUNBUFFERED: "1"
         run: python scripts/inventory_report_to_drive.py

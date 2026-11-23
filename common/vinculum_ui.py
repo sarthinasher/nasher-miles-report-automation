@@ -608,7 +608,7 @@ def parse_locations(raw):
     return {"bad": "PARSE", "options": [], "current": ""}
 
 
-def resolve_locations(available, spec):
+def resolve_locations(available, spec, skip=None):
     """Which location codes to export, in the order Vinculum lists them (or the
     order given). available = [code, ...]; spec = the VIN_LOCATIONS value:
       "" / "all" / "*"   -> every available location
@@ -616,10 +616,20 @@ def resolve_locations(available, spec):
       "all,-S01,-S02"    -> all but S01 / S02
       "NM4,?N10"         -> NM4, plus N10 if the user can switch to it (else a warning)
     Raises LocationError for a code the user cannot switch to (never silently
-    skipped, except a "?" optional one) or when nothing is left."""
+    skipped, except a "?" optional one) or when nothing is left.
+    skip = codes Vinculum lists but cannot switch to (unswitchable_locations()): they
+    are dropped with a "NOT exported" warning, also when the spec names them."""
     avail = [a.strip().upper() for a in available if a and a.strip()]
+    skip = {x.strip().upper() for x in (skip or ()) if x and x.strip()}
+    broken = [a for a in avail if a in skip]
+    if broken:
+        print(f"    [!] NOT exported - Vinculum lists {', '.join(broken)} but a switch to them "
+              f"blanks the session (since 19-Nov-2026): their stock / orders are missing from "
+              f"the file until the Vinculum admin fixes these locations (VIN_UNSWITCHABLE).")
+        avail = [a for a in avail if a not in skip]
+    optional_broken = set(broken)
     tokens = [t.strip().upper() for t in (spec or "").replace(";", ",").split(",") if t.strip()]
-    optional = {t[1:].strip() for t in tokens if t.startswith("?")}
+    optional = {t[1:].strip() for t in tokens if t.startswith("?")} | optional_broken
     include = [t[1:].strip() if t.startswith("?") else t for t in tokens if not t.startswith("-")]
     exclude = {t[1:].strip() for t in tokens if t.startswith("-")}
     if not include or any(t in ("ALL", "*") for t in include):
@@ -629,7 +639,7 @@ def resolve_locations(available, spec):
         if unknown:
             raise LocationError(f"VIN_LOCATIONS asks for {', '.join(unknown)}, but this Vinculum "
                                 f"user can only switch to: {', '.join(avail) or '(none)'}")
-        missing = [t for t in include if t not in avail]
+        missing = [t for t in include if t not in avail and t not in optional_broken]
         if missing:
             print(f"    [!] NOT exported - this Vinculum user cannot switch to "
                   f"{', '.join(missing)}: their orders are missing from the file until the "
@@ -675,6 +685,23 @@ def read_locations(page, base):
 # about them on every date and exports them as soon as the admin maps the user to them.
 LOCATIONS_WITH_ORDERS = "A03,GJ1,NM1,NM4,NM7,NM9,NM8,?N10,?A06"
 
+# 2026-11-23: since 19-Nov-2026 ~14:00 UTC Vinculum still lists these 8 locations on the
+# Switch Location page, but posting a switch to any of them answers with a blank location
+# (orgLocKey "_NASA") and the session dies (next page = login). Every job aborted at the
+# first one (Inventory: A02, Pick Pack: NM8). The other 11 switch fine. Checked one by one
+# with the probe workflow (mode dry_run, report switchall). They are skipped with a warning
+# until the Vinculum admin fixes them; then set the repo variable VIN_UNSWITCHABLE=none (or
+# the codes still broken). See "Errors and their fixes/2026-11-23-vinculum-8-locations-unswitchable.md".
+UNSWITCHABLE_LOCATIONS = "A02,NM2,S02,NM3,NM6,S03,NM8,W03"
+
+
+def unswitchable_locations():
+    """VIN_UNSWITCHABLE (env / repo variable; "none" = no skip), else UNSWITCHABLE_LOCATIONS."""
+    raw = (os.environ.get("VIN_UNSWITCHABLE") or "").strip()
+    if raw.lower() in ("none", "-", "off"):
+        return set()
+    return {c.strip().upper() for c in (raw or UNSWITCHABLE_LOCATIONS).replace(";", ",").split(",") if c.strip()}
+
 
 def location_spec(default=""):
     """VIN_LOCATIONS when set (workflow input / repo variable), else the script's default."""
@@ -692,7 +719,7 @@ def plan_locations(page, base, spec=None):
     print(f"    Vinculum locations this user can switch to ({len(names)}): "
           + ", ".join(f"{c} ({n})" for c, n in names.items()))
     print(f"    Session location after login: {current or '?'}")
-    chosen = resolve_locations(list(names), spec)
+    chosen = resolve_locations(list(names), spec, skip=unswitchable_locations())
     print(f"    Locations {spec!r} -> exporting {len(chosen)} location(s): {', '.join(chosen)}")
     skipped = [c for c in names if c not in chosen]
     if skipped:
@@ -920,7 +947,7 @@ def export_one_location(page, base, export_one, loc="", done=None):
     current = (info.get("current") or info.get("selected") or "").strip().upper()
     print(f"    Session location after login: {current or '?'}")
     if loc:
-        target = resolve_locations(avail, loc)[0]      # LocationError if not offered
+        target = resolve_locations(avail, loc, skip=unswitchable_locations())[0]  # LocationError if not offered / unswitchable
     else:
         target = current
         if not target:
