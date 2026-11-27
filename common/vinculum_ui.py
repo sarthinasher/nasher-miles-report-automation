@@ -789,6 +789,62 @@ def check_site_location(ctx, loc):
     return value.strip().upper() == loc.strip().upper()
 
 
+SET_SITE_LOCATION_JS = """
+    var want = arguments[0];
+    var s = document.querySelector('#siteLocationCode, #siteLoc, select[name=loc], select[name="reportDTO.siteLoc"]');
+    if (!s) return 'NOSELECT';
+    var hit = null;
+    for (var i = 0; i < s.options.length; i++) {
+        if ((s.options[i].value || '').trim().toUpperCase() === want) { hit = s.options[i].value; break; }
+    }
+    if (hit === null) return 'NOOPTION';
+    s.value = hit;
+    ['input', 'change'].forEach(function(n){ s.dispatchEvent(new Event(n, {bubbles: true})); });
+    if (window.jQuery) { try { window.jQuery(s).trigger('change'); } catch(e) {} }
+    return 'SET';
+"""
+
+
+def ensure_site_location(ctx, loc):
+    """Like check_site_location, but a select that is UNSET (-1 / blank, as on the MIS
+    Reports page since 20-Nov-2026) is set to loc first, when loc is one of its options.
+    True = it is loc now; False = still unset-and-loc-missing or another real code
+    (wrong location is never overridden); None = the screen has no such select."""
+    loc_u = loc.strip().upper()
+    try:
+        raw = ctx.run_js(SITE_LOCATION_JS) or ""
+    except Exception:
+        raw = ""
+    if not raw:
+        return None
+    value, _, opts = raw.partition("|")
+    value_u = value.strip().upper()
+    print(f"    Site Location on screen: {value} (options: {opts})")
+    if value_u == loc_u:
+        return True
+    if value_u not in ("", "-1"):
+        return False
+    options = [o.strip().upper() for o in opts.split(",")]
+    if loc_u not in options:
+        print(f"    [!] Site Location is unset ({value or 'blank'}) and {loc_u} is not among its options")
+        return False
+    try:
+        res = ctx.run_js(SET_SITE_LOCATION_JS.replace("arguments[0]", repr(loc_u)))
+    except Exception as e:
+        res = f"ERR {e!r}"
+    if res != "SET":
+        print(f"    [!] Could not set Site Location to {loc_u}: {res}")
+        return False
+    time.sleep(1)
+    try:
+        raw2 = ctx.run_js(SITE_LOCATION_JS) or ""
+    except Exception:
+        raw2 = ""
+    after = raw2.partition("|")[0].strip().upper()
+    print(f"    Site Location was {value or 'blank'} -> set to {loc_u}; now reads {after or '?'}")
+    return after == loc_u
+
+
 # Strict on purpose: a message wrongly taken as "no data" would silently drop that
 # location from the merged file; anything else just waits for the report (and fails
 # loudly if none comes).

@@ -51,7 +51,7 @@ from common.report_dates import SALES_REPORT_NAME, drive_filename, vinculum_date
 from common.report_merge import dry_run, keep_dry_run_copy, merge_for_upload, remove_attempt_files
 from common.vinculum_ui import (
     location_spec, export_one_location, single_location_choice,
-    SESSION_LOST_HINT, check_site_location, dismiss_top_modals, export_all_locations,
+    SESSION_LOST_HINT, ensure_site_location, dismiss_top_modals, export_all_locations,
     is_no_data_message, read_page_message, save_debug_screenshot, session_lost, set_report_date,
     vinculum_login,
 )
@@ -334,8 +334,8 @@ def _export_location(page, day, loc):
     if session_lost(page):
         fail(f"Logged out of Vinculum: {SESSION_LOST_HINT}.")
     dismiss_top_modals(page, "on MIS Reports")
-    if check_site_location(page, loc) is False:
-        fail(f"The MIS report's Site Location is not {loc} after switching location.")
+    if ensure_site_location(page, loc) is False:
+        fail(f"The MIS report's Site Location is not {loc} after switching location (it was not unset-and-settable, or shows another location).")
     result = page.run_js("""
         var targetSelect = null, targetValue = null;
         document.querySelectorAll('select').forEach(function(s) {

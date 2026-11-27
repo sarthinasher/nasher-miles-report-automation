@@ -347,3 +347,71 @@ def test_sales_default_location_is_switchable():
     default = re.search(r'^DEFAULT_SALES_LOCATION = "([A-Z0-9]+)"', src, re.M).group(1)
     import common.vinculum_ui as v
     assert default not in v.unswitchable_locations()
+
+
+# ── ensure_site_location: MIS Reports page Site Location unset (-1) since 20-Nov ──
+class FakeSiteSelect:
+    """Mimics ctx.run_js for the Site Location select."""
+
+    def __init__(self, value, options):
+        self.value, self.options, self.sets = value, options, []
+
+    def run_js(self, js):
+        if "dispatchEvent" in js:
+            want = js.split("var want = ", 1)[1].split(";", 1)[0].strip("'\"")
+            if want not in self.options:
+                return "NOOPTION"
+            self.value = want
+            self.sets.append(want)
+            return "SET"
+        return self.value + "|" + ",".join(self.options)
+
+
+def test_site_location_unset_is_set_then_ok():
+    from common.vinculum_ui import ensure_site_location
+    page = FakeSiteSelect("-1", ["-1", "A03", "H01"])
+    assert ensure_site_location(page, "H01") is True
+    assert page.sets == ["H01"]
+
+
+def test_site_location_blank_is_set_then_ok():
+    from common.vinculum_ui import ensure_site_location
+    page = FakeSiteSelect("", ["", "H01"])
+    assert ensure_site_location(page, "H01") is True
+
+
+def test_site_location_unset_and_loc_missing_fails():
+    from common.vinculum_ui import ensure_site_location
+    page = FakeSiteSelect("-1", ["-1", "A03"])
+    assert ensure_site_location(page, "H01") is False
+    assert page.sets == []
+
+
+def test_site_location_wrong_code_fails_and_is_not_touched():
+    from common.vinculum_ui import ensure_site_location
+    page = FakeSiteSelect("A03", ["-1", "A03", "H01"])
+    assert ensure_site_location(page, "H01") is False
+    assert page.sets == []
+
+
+def test_site_location_already_correct_no_change():
+    from common.vinculum_ui import ensure_site_location
+    page = FakeSiteSelect("H01", ["-1", "A03", "H01"])
+    assert ensure_site_location(page, "H01") is True
+    assert page.sets == []
+
+
+def test_site_location_no_select_is_none():
+    from common.vinculum_ui import ensure_site_location
+    assert ensure_site_location(FakeSiteSelect("", []) if False else type("P", (), {"run_js": lambda s, j: ""})(), "H01") is None
+
+
+def test_site_location_set_does_not_stick_fails():
+    from common.vinculum_ui import ensure_site_location
+
+    class Sticky(FakeSiteSelect):
+        def run_js(self, js):
+            if "dispatchEvent" in js:
+                return "SET"          # page ignores the change
+            return super().run_js(js)
+    assert ensure_site_location(Sticky("-1", ["-1", "H01"]), "H01") is False
